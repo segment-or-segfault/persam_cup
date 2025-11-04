@@ -58,9 +58,10 @@ def main():
         if not files:
             print("⚠️ No images found!")
         else:
-            referenceImage = os.path.join(images_path, sorted(files)[0])
+            referenceImage = os.path.join(images_path, files[0])
             base = os.path.basename(referenceImage) 
             referenceImageName = os.path.splitext(base)[0] 
+            print("Reference image:", referenceImageName)
             persam_f(args, None, images_path, masks_path, referenceImageName, output_path)
 
 
@@ -114,8 +115,8 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
 
     print("======> Obtain Self Location Prior" )
     # Image features encoding
-    # side effect: computes and stores the model’s image features in predictor.features.
-    # returns a mask-like tensor (a prompt / processed mask) which we assign back to ref_mask.
+    # side effect: computes and stores the model’s image features (embedding) in predictor.features.
+    # return a mask that you can later use to compute target features.
     ref_mask = predictor.set_image(ref_image, ref_mask)
     ref_feat = predictor.features.squeeze().permute(1, 2, 0)
 
@@ -124,15 +125,22 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
 
     # Target feature extraction describing the handle appearance
     target_feat = ref_feat[ref_mask > 0]
+    # Averages all feature vectors inside the masked region
+    # Captures the overall, smooth, dominant appearance of the object (stable against noise and small variations)
     target_feat_mean = target_feat.mean(0)
+    # Takes the elementwise maximum along each feature channel
+    # Highlights the most distinctive or strongest activations among those features (edges, colors, textures that are particularly characteristic)
     target_feat_max = torch.max(target_feat, dim=0)[0]
+    # Blends representativeness (mean) with discriminativeness (max)
     target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
 
-    # Cosine similarity
+    # Cosine similarity between target feature and all image features
     h, w, C = ref_feat.shape
+    # Normalize features
     target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
     ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
     ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
+    # gives a cosine similarity map between the target feature and every pixel feature in the image
     sim = target_feat @ ref_feat
 
     sim = sim.reshape(1, 1, h, w)
@@ -152,6 +160,10 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         plt.figure(figsize=(8, 8))
         plt.imshow(ref_image)
         plt.imshow(sim_np, cmap='jet', alpha=0.5)
+        # Mark the prompt location with a white x
+        prompt_xy = topk_xy[0]  # shape (2,) - [y,x]
+        # Use [x,y] for visualization since plt.scatter expects x,y order
+        plt.scatter([prompt_xy[0]], [prompt_xy[1]], c='white', marker='x', s=100, linewidths=2)
         plt.title('Location Prior (reference)')
         plt.axis('off')
         plt.savefig(prior_vis_ref, bbox_inches='tight')
@@ -239,6 +251,8 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         C, h, w = test_feat.shape
         test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
         test_feat = test_feat.reshape(C, h * w)
+        # For each test image, it finds the spatial location whose feature vector 
+        # best matches the reference prototype
         sim = target_feat @ test_feat
 
         sim = sim.reshape(1, 1, h, w)
@@ -257,6 +271,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             plt.figure(figsize=(8, 8))
             plt.imshow(test_image)
             plt.imshow(sim_np, cmap='jet', alpha=0.5)
+            show_points(topk_xy, topk_label, plt.gca())
             plt.title(f'Location Prior ({vis_test_image})')
             plt.axis('off')
             plt.savefig(prior_vis_path, bbox_inches='tight')
@@ -264,6 +279,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         except Exception:
             pass
 
+        # gives the prompt for SAM on the test image
         topk_xy, topk_label = point_selection(sim, topk=1)
 
         # First-step prediction
@@ -335,17 +351,40 @@ class Mask_Weights(nn.Module):
         super().__init__()
         self.weights = nn.Parameter(torch.ones(2, 1, requires_grad=True) / 3)
 
-
 def point_selection(mask_sim, topk=1):
     # Top-1 point selection
     w, h = mask_sim.shape
-    topk_xy = mask_sim.flatten(0).topk(topk)[1]
+    # Get both values and indices of top k
+    values, indices = mask_sim.flatten(0).topk(topk)
+    # print(f"\nShape of similarity map: {mask_sim.shape}")
+    # print(f"Max similarity value: {mask_sim.max().item():.4f}")
+    # print(f"Selected values: {values.cpu().numpy()}")
+    
+    # Find the 2D coordinates of the max value directly
+    # max_pos = mask_sim.argmax()
+    # max_x = (max_pos // h).item()
+    # max_y = (max_pos % h).item()
+    # print(f"Direct max position: ({max_x}, {max_y})")
+    
+    # Original calculation
+    topk_xy = indices
     topk_x = (topk_xy // h).unsqueeze(0)
     topk_y = (topk_xy - topk_x * h)
+    print(f"Calculated position: ({topk_x.item()}, {topk_y.item()})")
+    
+    # Get the similarity value at the calculated position
+    if torch.is_tensor(mask_sim):
+        calc_sim = mask_sim[topk_x.item(), topk_y.item()].item()
+    else:
+        calc_sim = mask_sim[topk_x.item(), topk_y.item()]
+    print(f"Similarity at calculated position: {calc_sim:.4f}")
+    
     topk_xy = torch.cat((topk_y, topk_x), dim=0).permute(1, 0)
     topk_label = np.array([1] * topk)
     topk_xy = topk_xy.cpu().numpy()
-    
+    print("Final selection point (x, y):", topk_xy)
+    print("Final selection label:", topk_label)
+
     return topk_xy, topk_label
 
 

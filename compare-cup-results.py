@@ -14,16 +14,18 @@ masks_dir = "Cups.v3i.coco-segmentation/test/Annotations"
 
 
 # list all mask files in first dir
-mask_files = sorted([
+mask_files = [
     f for f in os.listdir(dir1)
     # only show the masks
     if f.lower().endswith(('.png'))
-])
+]
 
 for mask_filename in mask_files:
     original_mask_path = os.path.join(masks_dir, mask_filename)
     mask1_path = os.path.join(dir1, mask_filename)
     mask2_path = os.path.join(dir2, mask_filename)
+    prior_path = os.path.join(dir2, "prior_" + mask_filename).replace(".png", ".jpg")
+    vis_path = os.path.join(dir2, "vis_mask_" + mask_filename).replace(".png", ".jpg")
 
     if not os.path.exists(mask2_path) or not os.path.exists(mask1_path):
         print(f"⚠️  Missing {mask_filename} in {dir1} or {dir2}, skipping.")
@@ -32,6 +34,8 @@ for mask_filename in mask_files:
     original_m = np.array(Image.open(original_mask_path).convert("L")) > 0
     m1 = np.array(Image.open(mask1_path).convert("L")) > 0
     m2 = np.array(Image.open(mask2_path).convert("L")) > 0
+    prior = np.array(Image.open(prior_path))
+    vis_mask = np.array(Image.open(vis_path))
 
     intersection_m1 = np.logical_and(m1, original_m).sum()
     union_m1 = np.logical_or(m1, original_m).sum()
@@ -56,17 +60,25 @@ for mask_filename in mask_files:
 
     # side-by-side view
     plt.figure(figsize=(12, 6))
-    plt.subplot(1, 3, 1)
+    plt.subplot(1, 5, 1)
     plt.imshow(img)
     plt.title("Original"); plt.axis("off")
 
-    plt.subplot(1, 3, 2)
+    plt.subplot(1, 5, 2)
     plt.imshow(mask1)
     plt.title(f"Persam Result with IoU = {iou_m1:.3f}"); plt.axis("off")
 
-    plt.subplot(1, 3, 3)
+    plt.subplot(1, 5, 3)
     plt.imshow(mask2)
     plt.title(f"Persam_f Result with IoU = {iou_m2:.3f}"); plt.axis("off")
+
+    plt.subplot(1, 5, 4)
+    plt.imshow(prior)
+    plt.title(f"Prior Result with IoU = {iou_m2:.3f}"); plt.axis("off")
+
+    plt.subplot(1, 5, 5)
+    plt.imshow(vis_mask)
+    plt.title(f"Vis Mask Result with IoU = {iou_m2:.3f}"); plt.axis("off")
 
     plt.suptitle(mask_filename, fontsize=14)
     plt.tight_layout()
