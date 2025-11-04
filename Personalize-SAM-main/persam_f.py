@@ -192,10 +192,10 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
 
         # Load test image
         if obj_name is None:
+            test_image_path = test_images[test_idx]
+        else:
             test_idx = '%02d' % test_idx
             test_image_path = test_images_path + '/' + test_idx + '.jpg'
-        else:
-            test_image_path = test_images[test_idx]
         test_image = cv2.imread(test_image_path)
         if test_image is None:
             print(f"[Warn] Missing test image, skipping: {test_image_path}")
