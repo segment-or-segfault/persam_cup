@@ -114,13 +114,15 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
 
     print("======> Obtain Self Location Prior" )
     # Image features encoding
+    # side effect: computes and stores the model’s image features in predictor.features.
+    # returns a mask-like tensor (a prompt / processed mask) which we assign back to ref_mask.
     ref_mask = predictor.set_image(ref_image, ref_mask)
     ref_feat = predictor.features.squeeze().permute(1, 2, 0)
 
     ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
     ref_mask = ref_mask.squeeze()[0]
 
-    # Target feature extraction
+    # Target feature extraction describing the handle appearance
     target_feat = ref_feat[ref_mask > 0]
     target_feat_mean = target_feat.mean(0)
     target_feat_max = torch.max(target_feat, dim=0)[0]
@@ -140,8 +142,23 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                     input_size=predictor.input_size,
                     original_size=predictor.original_size).squeeze()
 
-    # Positive location prior
+    # Positive location point on the reference object.
     topk_xy, topk_label = point_selection(sim, topk=1)
+
+    # Save reference location prior as a heatmap overlay on the reference image
+    try:
+        sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
+        prior_vis_ref = os.path.join(output_path, 'location_prior_ref.jpg')
+        plt.figure(figsize=(8, 8))
+        plt.imshow(ref_image)
+        plt.imshow(sim_np, cmap='jet', alpha=0.5)
+        plt.title('Location Prior (reference)')
+        plt.axis('off')
+        plt.savefig(prior_vis_ref, bbox_inches='tight')
+        plt.close()
+    except Exception:
+        # non-fatal: if plotting fails, continue
+        pass
 
 
     print('======> Start Training')
@@ -152,9 +169,11 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     optimizer = torch.optim.AdamW(mask_weights.parameters(), lr=args.lr, eps=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.train_epoch)
 
+    # Train combination weights
     for train_idx in range(args.train_epoch):
 
         # Run the decoder
+        # Uses the point we computed to tell SAM where to look
         masks, scores, logits, logits_high = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
@@ -192,13 +211,23 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
 
         # Load test image
         if obj_name is None:
-            test_idx = '%02d' % test_idx
-            test_image_path = test_images_path + '/' + test_idx + '.jpg'
+            # single-folder mode: use actual filenames from the directory
+            test_image_path = os.path.join(test_images_path, test_images[test_idx])
         else:
-            test_image_path = test_images[test_idx]
+            # object folder mode: images are named as 00.jpg, 01.jpg, ...
+            test_idx_str = '%02d' % test_idx
+            test_image_path = os.path.join(test_images_path, test_idx_str + '.jpg')
+
         test_image = cv2.imread(test_image_path)
         if test_image is None:
-            print(f"[Warn] Missing test image, skipping: {test_image_path}")
+            # Provide extra diagnostics to help debugging missing/corrupt files
+            try:
+                exists = os.path.exists(test_image_path)
+                fsize = os.path.getsize(test_image_path) if exists else None
+            except Exception:
+                exists = False
+                fsize = None
+            print(f"[Warn] Missing or unreadable test image, skipping: {test_image_path} (exists={exists}, size={fsize})")
             continue
         test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
 
@@ -220,6 +249,21 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                         original_size=predictor.original_size).squeeze()
 
         # Positive location prior
+        # Save test-image location prior as a heatmap overlay
+        try:
+            vis_test_image = os.path.splitext(os.path.basename(test_image_path))[0]
+            sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
+            prior_vis_path = os.path.join(output_path, f'prior_{vis_test_image}.jpg')
+            plt.figure(figsize=(8, 8))
+            plt.imshow(test_image)
+            plt.imshow(sim_np, cmap='jet', alpha=0.5)
+            plt.title(f'Location Prior ({vis_test_image})')
+            plt.axis('off')
+            plt.savefig(prior_vis_path, bbox_inches='tight')
+            plt.close()
+        except Exception:
+            pass
+
         topk_xy, topk_label = point_selection(sim, topk=1)
 
         # First-step prediction
