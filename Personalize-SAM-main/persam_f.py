@@ -192,13 +192,22 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
 
         # Load test image
         if obj_name is None:
-            test_image_path = test_images[test_idx]
+            # single-folder mode: use actual filenames from the directory
+            test_image_path = os.path.join(test_images_path, test_images[test_idx])
         else:
-            test_idx = '%02d' % test_idx
-            test_image_path = test_images_path + '/' + test_idx + '.jpg'
+            test_image_path = test_images[test_idx]
+            # object folder mode: images are named as 00.jpg, 01.jpg, ...
+            test_idx_str = '%02d' % test_idx
+            test_image_path = os.path.join(test_images_path, test_idx_str + '.jpg')
         test_image = cv2.imread(test_image_path)
         if test_image is None:
-            print(f"[Warn] Missing test image, skipping: {test_image_path}")
+            try:
+                exists = os.path.exists(test_image_path)
+                fsize = os.path.getsize(test_image_path) if exists else None
+            except Exception:
+                exists = False
+                fsize = None
+            print(f"[Warn] Missing or unreadable test image, skipping: {test_image_path} (exists={exists}, size={fsize})")
             continue
         test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
 
