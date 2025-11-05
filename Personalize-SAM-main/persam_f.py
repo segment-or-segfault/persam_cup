@@ -86,7 +86,12 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     ref_image = cv2.imread(ref_image_path)
     if ref_image is None:
         raise FileNotFoundError(f"Could not read reference image: {ref_image_path}. Verify --data, object name, index, and extension.")
-    ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
+    # Convert to grayscale
+    preprocessed_image = cv2.GaussianBlur(ref_image, (5, 5), sigmaX=0)
+
+    # Equalize histogram to enhance contrast / normalize lighting
+    # gray_eq = cv2.equalizeHist(gray)
+    # preprocessed_image = np.stack([gray]*3, axis=-1)
 
     ref_mask = cv2.imread(ref_mask_path)
     if ref_mask is None:
@@ -117,60 +122,75 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     # Image features encoding
     # side effect: computes and stores the model’s image features (embedding) in predictor.features.
     # return a mask that you can later use to compute target features.
+    predictor.set_image(preprocessed_image)
+    preprocessed_feat = predictor.features.squeeze().permute(1, 2, 0)
+
     ref_mask = predictor.set_image(ref_image, ref_mask)
     ref_feat = predictor.features.squeeze().permute(1, 2, 0)
 
     ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
     ref_mask = ref_mask.squeeze()[0]
 
-    # Target feature extraction describing the handle appearance
-    target_feat = ref_feat[ref_mask > 0]
-    # Averages all feature vectors inside the masked region
-    # Captures the overall, smooth, dominant appearance of the object (stable against noise and small variations)
-    target_feat_mean = target_feat.mean(0)
-    # Takes the elementwise maximum along each feature channel
-    # Highlights the most distinctive or strongest activations among those features (edges, colors, textures that are particularly characteristic)
-    target_feat_max = torch.max(target_feat, dim=0)[0]
-    # Blends representativeness (mean) with discriminativeness (max)
-    target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
+    topk_xy = np.empty((0, 2), dtype=np.int64)
+    topk_label = np.empty((0,), dtype=np.int64)
+    count = 0
+    for feat in [preprocessed_feat, ref_feat]:
+        count += 1
+        # Target feature extraction describing the handle appearance
+        target_feat = feat[ref_mask > 0]
+        # Averages all feature vectors inside the masked region
+        # Captures the overall, smooth, dominant appearance of the object (stable against noise and small variations)
+        target_feat_mean = target_feat.mean(0)
+        # Takes the elementwise maximum along each feature channel
+        # Highlights the most distinctive or strongest activations among those features (edges, colors, textures that are particularly characteristic)
+        target_feat_max = torch.max(target_feat, dim=0)[0]
+        # Blends representativeness (mean) with discriminativeness (max)
+        target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
 
-    # Cosine similarity between target feature and all image features
-    h, w, C = ref_feat.shape
-    # Normalize features
-    target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
-    ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
-    ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
-    # gives a cosine similarity map between the target feature and every pixel feature in the image
-    sim = target_feat @ ref_feat
+        # Cosine similarity between target feature and all image features
+        h, w, C = feat.shape
+        # Normalize features
+        target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+        feat = feat.permute(2, 0, 1).reshape(C, h * w)
+        # gives a cosine similarity map between the target feature and every pixel feature in the image
+        sim = target_feat @ feat
 
-    sim = sim.reshape(1, 1, h, w)
-    sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
-    sim = predictor.model.postprocess_masks(
-                    sim,
-                    input_size=predictor.input_size,
-                    original_size=predictor.original_size).squeeze()
+        sim = sim.reshape(1, 1, h, w)
+        sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+        sim = predictor.model.postprocess_masks(
+                        sim,
+                        input_size=predictor.input_size,
+                        original_size=predictor.original_size).squeeze()
 
-    # Positive location point on the reference object.
-    topk_xy, topk_label = point_selection(sim, topk=1)
+        # Positive location point on the reference object.
+        xy, label = point_selection(sim, topk=1)
 
-    # Save reference location prior as a heatmap overlay on the reference image
-    try:
-        sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
-        prior_vis_ref = os.path.join(output_path, 'location_prior_ref.jpg')
-        plt.figure(figsize=(8, 8))
-        plt.imshow(ref_image)
-        plt.imshow(sim_np, cmap='jet', alpha=0.5)
-        # Mark the prompt location with a white x
-        prompt_xy = topk_xy[0]  # shape (2,) - [y,x]
-        # Use [x,y] for visualization since plt.scatter expects x,y order
-        plt.scatter([prompt_xy[0]], [prompt_xy[1]], c='white', marker='x', s=100, linewidths=2)
-        plt.title('Location Prior (reference)')
-        plt.axis('off')
-        plt.savefig(prior_vis_ref, bbox_inches='tight')
-        plt.close()
-    except Exception:
-        # non-fatal: if plotting fails, continue
-        pass
+        xy = np.asarray(xy, dtype=np.int64).reshape(-1, 2)
+        label = np.asarray(label, dtype=np.int64).reshape(-1)
+
+        # Concatenate as numpy arrays
+        topk_xy = np.concatenate((topk_xy, xy), axis=0)
+        topk_label = np.concatenate((topk_label, label), axis=0)
+
+        # Save reference location prior as a heatmap overlay on the reference image
+        try:
+            sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
+            prior_vis_ref = os.path.join(output_path, 'location_prior_ref_{}.jpg'.format(count))
+            plt.figure(figsize=(8, 8))
+            plt.imshow(ref_image)
+            plt.imshow(sim_np, cmap='jet', alpha=0.5)
+            # Mark the prompt location with a white x
+            prompt_xy = topk_xy[0]  # shape (2,) - [y,x]
+            # Use [x,y] for visualization since plt.scatter expects x,y order
+            plt.scatter([prompt_xy[0]], [prompt_xy[1]], c='white', marker='x', s=100, linewidths=2)
+            plt.title('Location Prior (reference)')
+            plt.axis('off')
+            plt.savefig(prior_vis_ref, bbox_inches='tight')
+            plt.close()
+        except Exception:
+            # non-fatal: if plotting fails, continue
+            pass
 
 
     print('======> Start Training')
@@ -243,30 +263,63 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             continue
         test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
 
+        test_preprocessed_image = cv2.GaussianBlur(test_image, (5, 5), sigmaX=0)
+        # test_gray = cv2.cvtColor(test_image, cv2.COLOR_RGB2GRAY)
+
+        # Equalize histogram to enhance contrast / normalize lighting
+        # test_gray_eq = cv2.equalizeHist(test_gray)
+        # test_preprocessed_image = np.stack([test_gray]*3, axis=-1)
+
+        # Gray test Image feature encoding
+        predictor.set_image(test_preprocessed_image)
+        test_gray_feat = predictor.features.squeeze()
+
         # Image feature encoding
         predictor.set_image(test_image)
         test_feat = predictor.features.squeeze()
-
-        # Cosine similarity
+        
+        # Cosine similarity for the test image
         C, h, w = test_feat.shape
         test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
         test_feat = test_feat.reshape(C, h * w)
-        # For each test image, it finds the spatial location whose feature vector 
+        # For each test image, it finds the spatial location whose feature vector
         # best matches the reference prototype
-        sim = target_feat @ test_feat
+        test_sim = target_feat @ test_feat
 
-        sim = sim.reshape(1, 1, h, w)
-        sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
-        sim = predictor.model.postprocess_masks(
-                        sim,
-                        input_size=predictor.input_size,
-                        original_size=predictor.original_size).squeeze()
+        # Cosine similarity for the gray test image
+        C, h, w = test_gray_feat.shape
+        test_gray_feat = test_gray_feat / test_gray_feat.norm(dim=0, keepdim=True)
+        test_gray_feat = test_gray_feat.reshape(C, h * w)
+        # For each test image, it finds the spatial location whose feature vector
+        # best matches the reference prototype
+        test_gray_sim = target_feat @ test_gray_feat
+
+        topk_xy = np.empty((0, 2), dtype=np.int64)
+        topk_label = np.empty((0,), dtype=np.int64)
+
+        for sim in [test_gray_sim, test_sim]:
+            sim = sim.reshape(1, 1, h, w)
+            sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+            sim = predictor.model.postprocess_masks(
+                            sim,
+                            input_size=predictor.input_size,
+                            original_size=predictor.original_size).squeeze()
+            
+            # gives the prompt for SAM on the test image
+            xy, label = point_selection(sim, topk=1)
+
+            xy = np.asarray(xy, dtype=np.int64).reshape(-1, 2)
+            label = np.asarray(label, dtype=np.int64).reshape(-1)
+
+            # Concatenate as numpy arrays
+            topk_xy = np.concatenate((topk_xy, xy), axis=0)
+            topk_label = np.concatenate((topk_label, label), axis=0)
 
         # Positive location prior
         # Save test-image location prior as a heatmap overlay
         try:
             vis_test_image = os.path.splitext(os.path.basename(test_image_path))[0]
-            sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
+            sim_np = sim.detach().cpu().numpy() if isinstance(test_sim, torch.Tensor) else np.array(sim)
             prior_vis_path = os.path.join(output_path, f'prior_{vis_test_image}.jpg')
             plt.figure(figsize=(8, 8))
             plt.imshow(test_image)
@@ -278,9 +331,6 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             plt.close()
         except Exception:
             pass
-
-        # gives the prompt for SAM on the test image
-        topk_xy, topk_label = point_selection(sim, topk=1)
 
         # First-step prediction
         masks, scores, logits, logits_high = predictor.predict(

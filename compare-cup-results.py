@@ -20,7 +20,12 @@ mask_files = [
     if f.lower().endswith(('.png'))
 ]
 
+current_num = 0
+persam_mark = 0
+persamf_mark = 0
+
 for mask_filename in mask_files:
+    current_num += 1
     original_mask_path = os.path.join(masks_dir, mask_filename)
     mask1_path = os.path.join(dir1, mask_filename)
     mask2_path = os.path.join(dir2, mask_filename)
@@ -40,10 +45,14 @@ for mask_filename in mask_files:
     intersection_m1 = np.logical_and(m1, original_m).sum()
     union_m1 = np.logical_or(m1, original_m).sum()
     iou_m1 = intersection_m1 / union_m1 if union_m1 > 0 else 0
+    if iou_m1 >= 0.7:
+        persam_mark += 1
 
     intersection_m2 = np.logical_and(m2, original_m).sum()
     union_m2 = np.logical_or(m2, original_m).sum()
     iou_m2 = intersection_m2 / union_m2 if union_m2 > 0 else 0
+    if iou_m2 >= 0.7:
+        persamf_mark += 1
 
     # load both masks
     mask1 = np.array(Image.open(mask1_path).convert("RGB"))
@@ -57,6 +66,7 @@ for mask_filename in mask_files:
         img = np.zeros_like(mask1)
 
     intersection = np.logical_and(m1, m2).sum()
+
 
     # side-by-side view
     plt.figure(figsize=(12, 6))
@@ -74,12 +84,13 @@ for mask_filename in mask_files:
 
     plt.subplot(1, 5, 4)
     plt.imshow(prior)
-    plt.title(f"Prior Result with IoU = {iou_m2:.3f}"); plt.axis("off")
 
     plt.subplot(1, 5, 5)
     plt.imshow(vis_mask)
-    plt.title(f"Vis Mask Result with IoU = {iou_m2:.3f}"); plt.axis("off")
 
-    plt.suptitle(mask_filename, fontsize=14)
+    plt.suptitle(
+        f"{mask_filename} persam score: {persam_mark / current_num:.2f} | persam_f score: {persamf_mark / current_num:.2f}",
+        fontsize=14
+    )
     plt.tight_layout()
     plt.show()
