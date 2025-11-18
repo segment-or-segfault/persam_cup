@@ -13,6 +13,8 @@ warnings.filterwarnings('ignore')
 
 from show import *
 from per_segment_anything import sam_model_registry, SamPredictor
+from per_segment_anything.adaptive_fusion import AdaptiveMaskFusion
+
 
 device = "cuda" if torch.cuda.is_available() else \
          "mps" if torch.backends.mps.is_available() else "cpu"
@@ -141,16 +143,23 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                     original_size=predictor.original_size).squeeze()
 
     # Positive location prior
-    topk_xy, topk_label = point_selection(sim, topk=1)
+    topk_xy, topk_label = point_selection(sim, topk=5)
 
 
     print('======> Start Training')
     # Learnable mask weights
-    mask_weights = Mask_Weights().to(device)
-    mask_weights.train()
+    # mask_weights = Mask_Weights().to(device)
+    # mask_weights.train()
     
-    optimizer = torch.optim.AdamW(mask_weights.parameters(), lr=args.lr, eps=1e-4)
+    # optimizer = torch.optim.AdamW(mask_weights.parameters(), lr=args.lr, eps=1e-4)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.train_epoch)
+
+    fusion = AdaptiveMaskFusion().to(device)
+    fusion.train()
+
+    optimizer = torch.optim.AdamW(fusion.parameters(), lr=args.lr, eps=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.train_epoch)
+
 
     for train_idx in range(args.train_epoch):
 
@@ -159,21 +168,29 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             point_coords=topk_xy,
             point_labels=topk_label,
             multimask_output=True)
-        logits_high = logits_high.flatten(1)
+        
+        # logits_high = logits_high.flatten(1)
 
         # Weighted sum three-scale masks
-        weights = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
-        logits_high = logits_high * weights
-        logits_high = logits_high.sum(0).unsqueeze(0)
+        # weights = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
+        # logits_high = logits_high * weights
+        # logits_high = logits_high.sum(0).unsqueeze(0)
 
-        dice_loss = calculate_dice_loss(logits_high, gt_mask)
-        focal_loss = calculate_sigmoid_focal_loss(logits_high, gt_mask)
+        # dice_loss = calculate_dice_loss(logits_high, gt_mask)
+        # focal_loss = calculate_sigmoid_focal_loss(logits_high, gt_mask)
+        fused_logits = fusion(logits_high).flatten(1)
+
+        # [H,W]
+        # fused_logits = fused_logits.unsqueeze(0).flatten(1)  # [1, H*W]
+
+        dice_loss = calculate_dice_loss(fused_logits, gt_mask)
+        focal_loss = calculate_sigmoid_focal_loss(fused_logits, gt_mask)
         loss = dice_loss + focal_loss
-
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         scheduler.step()
+
 
         if train_idx % args.log_epoch == 0:
             print('Train Epoch: {:} / {:}'.format(train_idx, args.train_epoch))
@@ -181,10 +198,14 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             print('LR: {:.6f}, Dice_Loss: {:.4f}, Focal_Loss: {:.4f}'.format(current_lr, dice_loss.item(), focal_loss.item()))
 
 
-    mask_weights.eval()
-    weights = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
-    weights_np = weights.detach().cpu().numpy()
-    print('======> Mask weights:\n', weights_np)
+    # mask_weights.eval()
+
+    # weights = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
+    # weights_np = weights.detach().cpu().numpy()
+    # print('======> Mask weights:\n', weights_np)
+    fusion.eval()
+    learned_w = fusion.learnable_weights.detach().cpu().numpy()
+    print("======> Learned Edge-aware Fusion Weights =", learned_w)
 
     print('======> Start Testing')
     test_images = os.listdir(test_images_path)
@@ -195,7 +216,6 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             # single-folder mode: use actual filenames from the directory
             test_image_path = os.path.join(test_images_path, test_images[test_idx])
         else:
-            test_image_path = test_images[test_idx]
             # object folder mode: images are named as 00.jpg, 01.jpg, ...
             test_idx_str = '%02d' % test_idx
             test_image_path = os.path.join(test_images_path, test_idx_str + '.jpg')
@@ -238,57 +258,119 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                     multimask_output=True)
 
         # Weighted sum three-scale masks
-        logits_high = logits_high * weights.unsqueeze(-1)
-        logit_high = logits_high.sum(0)
-        mask = (logit_high > 0).detach().cpu().numpy()
+        # logits_high = logits_high * weights.unsqueeze(-1)
+        # logit_high = logits_high.sum(0)
+        # mask = (logit_high > 0).detach().cpu().numpy()
+        with torch.no_grad():
+            logits_high_t = logits_high.to(device, dtype=torch.float32)
 
-        logits = logits * weights_np[..., None]
-        logit = logits.sum(0)
+            fused = fusion(logits_high_t)     # [1,H,W]
+        mask = (fused.squeeze(0) > 0).cpu().numpy()
+
+
+        # logits = logits * weights_np[..., None]
+        # logit = logits.sum(0)
+        with torch.no_grad():
+            logits_t = torch.as_tensor(logits, dtype=torch.float32, device=device)
+
+            fused_logits = fusion(logits_t)
+        logit = fused_logits.squeeze(0).cpu().numpy()
 
         # Cascaded Post-refinement-1
-        y, x = np.nonzero(mask)
-        x_min = x.min()
-        x_max = x.max()
-        y_min = y.min()
-        y_max = y.max()
-        input_box = np.array([x_min, y_min, x_max, y_max])
-        masks, scores, logits, _ = predictor.predict(
-            point_coords=topk_xy,
-            point_labels=topk_label,
-            box=input_box[None, :],
-            mask_input=logit[None, :, :],
-            multimask_output=True)
-        best_idx = np.argmax(scores)
+        # y, x = np.nonzero(mask)
+        # x_min = x.min()
+        # x_max = x.max()
+        # y_min = y.min()
+        # y_max = y.max()
+        # input_box = np.array([x_min, y_min, x_max, y_max])
+        # masks, scores, logits, _ = predictor.predict(
+        #     point_coords=topk_xy,
+        #     point_labels=topk_label,
+        #     box=input_box[None, :],
+        #     mask_input=logit[None, :, :],
+        #     multimask_output=True)
+        # best_idx = np.argmax(scores)
 
-        # Cascaded Post-refinement-2
-        y, x = np.nonzero(masks[best_idx])
-        x_min = x.min()
-        x_max = x.max()
-        y_min = y.min()
-        y_max = y.max()
+        # # Cascaded Post-refinement-2
+        # y, x = np.nonzero(masks[best_idx])
+        # x_min = x.min()
+        # x_max = x.max()
+        # y_min = y.min()
+        # y_max = y.max()
+        # input_box = np.array([x_min, y_min, x_max, y_max])
+        # masks, scores, logits, _ = predictor.predict(
+        #     point_coords=topk_xy,
+        #     point_labels=topk_label,
+        #     box=input_box[None, :],
+        #     mask_input=logits[best_idx: best_idx + 1, :, :],
+        #     multimask_output=True)
+        # best_idx = np.argmax(scores)
+
+        # ---- Cascaded Post-refinement using fused mask ----
+        # 1. Use fused mask instead of masks[best_idx]
+        y, x = np.nonzero(mask)
+        if len(x) == 0 or len(y) == 0:
+            continue    # skip empty prediction (avoid crash)
+
+        x_min, x_max = x.min(), x.max()
+        y_min, y_max = y.min(), y.max()
         input_box = np.array([x_min, y_min, x_max, y_max])
+
+
+        # First refinement
         masks, scores, logits, _ = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
             box=input_box[None, :],
-            mask_input=logits[best_idx: best_idx + 1, :, :],
-            multimask_output=True)
-        best_idx = np.argmax(scores)
+            mask_input=fused_logits.squeeze(0).cpu().numpy()[None, :, :],
+            multimask_output=True
+        )
+
+        # Now fuse AGAIN instead of best_idx
+        with torch.no_grad():
+            logits_t = torch.as_tensor(logits, dtype=torch.float32, device=device)
+            fused_logits2 = fusion(logits_t)
+        mask = (fused_logits2.squeeze(0) > 0).cpu().numpy()
+
+        # Second refinement
+        y, x = np.nonzero(mask)
+        if len(x) == 0 or len(y) == 0:
+            continue
+
+        x_min, x_max = x.min(), x.max()
+        y_min, y_max = y.min(), y.max()
+        input_box = np.array([x_min, y_min, x_max, y_max])
+
+        masks, scores, logits, _ = predictor.predict(
+            point_coords=topk_xy,
+            point_labels=topk_label,
+            box=input_box[None, :],
+            mask_input=fused_logits2.squeeze(0).cpu().numpy()[None, :, :],
+            multimask_output=True
+        )
+
+        # Final fused mask
+        with torch.no_grad():
+            logits_t = torch.as_tensor(logits, dtype=torch.float32, device=device)
+            fused_final = fusion(logits_t)
+
+        final_mask = (fused_final.squeeze(0) > 0).cpu().numpy()
         
         # Save masks
         plt.figure(figsize=(10, 10))
         plt.imshow(test_image)
-        show_mask(masks[best_idx], plt.gca())
+        show_mask(final_mask, plt.gca())               # ✅ show fused mask
         show_points(topk_xy, topk_label, plt.gca())
-        plt.title(f"Mask {best_idx}", fontsize=18)
+        plt.title("Fused Final Mask", fontsize=18)
         plt.axis('off')
-        base = os.path.basename(test_image_path) 
-        vis_test_image = os.path.splitext(base)[0] 
-        vis_mask_output_path = os.path.join(output_path, f'vis_mask_{vis_test_image}.jpg')
-        with open(vis_mask_output_path, 'wb') as outfile:
-            plt.savefig(outfile, format='jpg')
 
-        final_mask = masks[best_idx]
+        base = os.path.basename(test_image_path)
+        vis_test_image = os.path.splitext(base)[0]
+        vis_mask_output_path = os.path.join(output_path, f"vis_mask_{vis_test_image}.jpg")
+        plt.savefig(vis_mask_output_path, format='jpg')
+        plt.close()
+
+        # Save raw PNG mask
         mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
         mask_colors[final_mask, :] = np.array([[0, 0, 128]])
         mask_output_path = os.path.join(output_path, vis_test_image + '.png')
