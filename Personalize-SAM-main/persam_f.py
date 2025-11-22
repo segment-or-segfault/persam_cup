@@ -141,7 +141,8 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
     ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
     # gives a cosine similarity map between the target feature and every pixel feature in the image
-    sim = target_feat @ ref_feat
+    D = target_feat.shape[-1] 
+    sim = target_feat @ ref_feat / (D ** 0.5)
 
     sim = sim.reshape(1, 1, h, w)
     sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
@@ -151,7 +152,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                     original_size=predictor.original_size).squeeze()
 
     # Positive location point on the reference object.
-    topk_xy, topk_label = point_selection(sim, topk=1)
+    topk_xy, topk_label = point_selection(sim, topk=10)
 
     # Save reference location prior as a heatmap overlay on the reference image
     try:
@@ -253,7 +254,8 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         test_feat = test_feat.reshape(C, h * w)
         # For each test image, it finds the spatial location whose feature vector 
         # best matches the reference prototype
-        sim = target_feat @ test_feat
+        D = target_feat.shape[-1] 
+        sim = target_feat @ test_feat / (D ** 0.5)
 
         sim = sim.reshape(1, 1, h, w)
         sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
@@ -352,39 +354,14 @@ class Mask_Weights(nn.Module):
         self.weights = nn.Parameter(torch.ones(2, 1, requires_grad=True) / 3)
 
 def point_selection(mask_sim, topk=1):
-    # Top-1 point selection
     w, h = mask_sim.shape
-    # Get both values and indices of top k
-    values, indices = mask_sim.flatten(0).topk(topk)
-    # print(f"\nShape of similarity map: {mask_sim.shape}")
-    # print(f"Max similarity value: {mask_sim.max().item():.4f}")
-    # print(f"Selected values: {values.cpu().numpy()}")
-    
-    # Find the 2D coordinates of the max value directly
-    # max_pos = mask_sim.argmax()
-    # max_x = (max_pos // h).item()
-    # max_y = (max_pos % h).item()
-    # print(f"Direct max position: ({max_x}, {max_y})")
-    
-    # Original calculation
-    topk_xy = indices
+    topk_xy = mask_sim.flatten(0).topk(topk)[1]
     topk_x = (topk_xy // h).unsqueeze(0)
     topk_y = (topk_xy - topk_x * h)
-    print(f"Calculated position: ({topk_x.item()}, {topk_y.item()})")
-    
-    # Get the similarity value at the calculated position
-    if torch.is_tensor(mask_sim):
-        calc_sim = mask_sim[topk_x.item(), topk_y.item()].item()
-    else:
-        calc_sim = mask_sim[topk_x.item(), topk_y.item()]
-    print(f"Similarity at calculated position: {calc_sim:.4f}")
-    
     topk_xy = torch.cat((topk_y, topk_x), dim=0).permute(1, 0)
     topk_label = np.array([1] * topk)
     topk_xy = topk_xy.cpu().numpy()
-    print("Final selection point (x, y):", topk_xy)
-    print("Final selection label:", topk_label)
-
+    
     return topk_xy, topk_label
 
 
