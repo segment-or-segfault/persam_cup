@@ -265,6 +265,21 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                         original_size=predictor.original_size).squeeze()
 
         # Positive location prior
+        # gives the prompt for SAM on the test image
+        topk_xy, topk_label = point_selection(sim, topk=1)
+        # print("topyk_xy before neg:", topk_xy)
+        # print("topyk_label before neg:", topk_label)
+
+        # add negative points
+        neg_xy, neg_label = negative_point_selection(topk_xy, sim, threshold=0.7, step=10000, window=100)
+        # print("neg_xy:", neg_xy)
+        # print("neg_label:", neg_label)
+
+        topk_xy = np.concatenate((topk_xy, neg_xy), axis=0)
+        topk_label = np.concatenate((topk_label, neg_label), axis=0)
+        # print("topyk_xy after neg:", topk_xy)
+        # print("topyk_label after neg:", topk_label)
+
         # Save test-image location prior as a heatmap overlay
         try:
             vis_test_image = os.path.splitext(os.path.basename(test_image_path))[0]
@@ -272,7 +287,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             prior_vis_path = os.path.join(output_path, f'prior_{vis_test_image}.jpg')
             plt.figure(figsize=(8, 8))
             plt.imshow(test_image)
-            plt.imshow(sim_np, cmap='jet', alpha=0.5)
+            plt.imshow(sim_np, cmap='jet', alpha=1.0)
             show_points(topk_xy, topk_label, plt.gca())
             plt.title(f'Location Prior ({vis_test_image})')
             plt.axis('off')
@@ -281,50 +296,47 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         except Exception:
             pass
 
-        # gives the prompt for SAM on the test image
-        topk_xy, topk_label = point_selection(sim, topk=1)
+        # # First-step prediction
+        # masks, scores, logits, logits_high = predictor.predict(
+        #             point_coords=topk_xy,
+        #             point_labels=topk_label,
+        #             multimask_output=True)
 
-        # First-step prediction
-        masks, scores, logits, logits_high = predictor.predict(
-                    point_coords=topk_xy,
-                    point_labels=topk_label,
-                    multimask_output=True)
+        # # Weighted sum three-scale masks
+        # logits_high = logits_high * weights.unsqueeze(-1)
+        # logit_high = logits_high.sum(0)
+        # mask = (logit_high > 0).detach().cpu().numpy()
 
-        # Weighted sum three-scale masks
-        logits_high = logits_high * weights.unsqueeze(-1)
-        logit_high = logits_high.sum(0)
-        mask = (logit_high > 0).detach().cpu().numpy()
+        # logits = logits * weights_np[..., None]
+        # logit = logits.sum(0)
 
-        logits = logits * weights_np[..., None]
-        logit = logits.sum(0)
+        # # Cascaded Post-refinement-1
+        # y, x = np.nonzero(mask)
+        # x_min = x.min()
+        # x_max = x.max()
+        # y_min = y.min()
+        # y_max = y.max()
+        # input_box = np.array([x_min, y_min, x_max, y_max])
+        # masks, scores, logits, _ = predictor.predict(
+        #     point_coords=topk_xy,
+        #     point_labels=topk_label,
+        #     box=input_box[None, :],
+        #     mask_input=logit[None, :, :],
+        #     multimask_output=True)
+        # best_idx = np.argmax(scores)
 
-        # Cascaded Post-refinement-1
-        y, x = np.nonzero(mask)
-        x_min = x.min()
-        x_max = x.max()
-        y_min = y.min()
-        y_max = y.max()
-        input_box = np.array([x_min, y_min, x_max, y_max])
+        # # Cascaded Post-refinement-2
+        # y, x = np.nonzero(masks[best_idx])
+        # x_min = x.min()
+        # x_max = x.max()
+        # y_min = y.min()
+        # y_max = y.max()
+        # input_box = np.array([x_min, y_min, x_max, y_max])
         masks, scores, logits, _ = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
-            box=input_box[None, :],
-            mask_input=logit[None, :, :],
-            multimask_output=True)
-        best_idx = np.argmax(scores)
-
-        # Cascaded Post-refinement-2
-        y, x = np.nonzero(masks[best_idx])
-        x_min = x.min()
-        x_max = x.max()
-        y_min = y.min()
-        y_max = y.max()
-        input_box = np.array([x_min, y_min, x_max, y_max])
-        masks, scores, logits, _ = predictor.predict(
-            point_coords=topk_xy,
-            point_labels=topk_label,
-            box=input_box[None, :],
-            mask_input=logits[best_idx: best_idx + 1, :, :],
+            # box=input_box[None, :],
+            # mask_input=logits[best_idx: best_idx + 1, :, :],
             multimask_output=True)
         best_idx = np.argmax(scores)
         
@@ -361,8 +373,49 @@ def point_selection(mask_sim, topk=1):
     topk_xy = torch.cat((topk_y, topk_x), dim=0).permute(1, 0)
     topk_label = np.array([1] * topk)
     topk_xy = topk_xy.cpu().numpy()
-    
+    print("topk_xy:", topk_xy)
     return topk_xy, topk_label
+
+def negative_point_selection(pos_xy, mask_sim, threshold=0.7, step=10000, window=100):
+    # unpack positive point (pos_xy is [[px, py]])
+    px, py = pos_xy[0]
+
+    # convert to numpy
+    mask_np = mask_sim.cpu().numpy()
+    sim_min = mask_np.min()
+    sim_max = mask_np.max()
+    sim_norm = (mask_np - sim_min) / (sim_max - sim_min + 1e-8)
+
+    # find all negative points (before filtering)
+    ys, xs = np.where(sim_norm < threshold)
+
+    # --- LOCAL WINDOW FILTER ---
+    half = window // 2
+    x_low, x_high = px - half, px + half
+    y_low, y_high = py - half, py + half
+
+    # boolean mask selecting points inside the window
+    in_window = (
+        (xs >= x_low) & (xs <= x_high) &
+        (ys >= y_low) & (ys <= y_high)
+    )
+
+    xs = xs[in_window]
+    ys = ys[in_window]
+
+    # fallback if none
+    if len(xs) == 0:
+        y, x = np.unravel_index(mask_np.argmin(), mask_np.shape)
+        return np.array([[x, y]]), np.array([0])
+
+    # stack
+    neg_xy = np.stack((xs, ys), axis=-1)
+
+    # subsample (optional)
+    neg_xy = neg_xy[::step]
+
+    neg_label = np.zeros(len(neg_xy), dtype=np.int32)
+    return neg_xy, neg_label
 
 
 def calculate_dice_loss(inputs, targets, num_masks = 1):
