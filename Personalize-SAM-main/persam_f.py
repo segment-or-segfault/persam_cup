@@ -1,3 +1,5 @@
+from transformers import AutoImageProcessor, AutoModel
+from PIL import Image
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,6 +18,51 @@ from per_segment_anything import sam_model_registry, SamPredictor
 
 device = "cuda" if torch.cuda.is_available() else \
          "mps" if torch.backends.mps.is_available() else "cpu"
+
+print("Loading DINOv2...")
+dino_processor = AutoImageProcessor.from_pretrained("facebook/dinov2-large")
+dino_model = AutoModel.from_pretrained("facebook/dinov2-large").to(device)
+dino_model.eval()
+
+@torch.no_grad()
+def extract_dino_features(img_np):
+    """
+    img_np: RGB uint8 numpy array [H, W, 3]
+    returns:
+        feat_hwD: [H_feat, W_feat, D]
+        feat_flat: [HW_feat, D]
+        (H_feat, W_feat)
+    """
+
+    img_pil = Image.fromarray(img_np)
+    inputs = dino_processor(images=img_pil, return_tensors="pt").to(device)
+
+    out = dino_model(**inputs)
+    # remove CLS token: out.last_hidden_state: [1, 1+HW, D]
+    feat_flat = out.last_hidden_state[:, 1:, :]        # [1, HW, D]
+    feat_flat = F.normalize(feat_flat, dim=-1)         # cosine norm
+    feat_flat = feat_flat.squeeze(0)                   # [HW, D]
+
+    N, D = feat_flat.shape
+    H_feat = W_feat = int(N**0.5)
+
+    feat_hwD = feat_flat.reshape(H_feat, W_feat, D)
+
+    return feat_hwD, feat_flat, (H_feat, W_feat)
+
+# Save original interpolate
+_original_interpolate = F.interpolate
+
+def safe_interpolate(input, size=None, scale_factor=None, mode='bicubic', align_corners=False):
+    # If MPS: convert unsupported bicubic → bilinear
+    if mode == 'bicubic':
+        mode = 'bilinear'
+    # Call PyTorch's real interpolate, not the monkey-patched one
+    return _original_interpolate(input, size=size, scale_factor=scale_factor,
+                                 mode=mode, align_corners=align_corners)
+
+# Monkey patch
+F.interpolate = safe_interpolate
 
 
 def get_arguments():
@@ -123,7 +170,25 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         print("======> Obtain Self Location Prior" )
         edge = get_color_outline(ref_image_rot)
         img_for_similarity = combine_edges_with_image(ref_image_rot, edge)
-        # Image features encoding
+        # DINO
+        feat_hwD, feat_flat, (H_feat, W_feat) = extract_dino_features(img_for_similarity)
+        # ref_mask = binary mask [H, W]
+
+        # Resize mask to match DINO feature resolution
+        ref_mask_gray = ref_mask_rot[:, :, 0] > 0   # shape [H, W]
+        ref_mask_small = cv2.resize(ref_mask_gray.astype(np.uint8),
+                                    (W_feat, H_feat),
+                                    interpolation=cv2.INTER_NEAREST)
+        ref_mask_small = torch.tensor(ref_mask_small, device=device)
+        # Convert to torch on same device as DINO feat
+        ref_mask_small = torch.tensor(ref_mask_small, device=device, dtype=torch.bool)
+
+        # Extract prototype handle feature
+        proto_dino = feat_hwD[ref_mask_small > 0].mean(0)    # [D]
+        proto_dino = F.normalize(proto_dino, dim=0)
+
+
+        # SAM Image features encoding
         # side effect: computes and stores the model’s image features (embedding) in predictor.features.
         # return a mask that you can later use to compute target features.
         ref_mask = predictor.set_image(img_for_similarity, ref_mask_rot)
@@ -262,7 +327,15 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
 
             edge = get_color_outline(test_image)
             img_for_similarity = combine_edges_with_image(test_image, edge)
-            # Image feature encoding
+            # DINO
+            test_dino_hwD, _, (hD, wD) = extract_dino_features(img_for_similarity)
+            sim_dino = torch.einsum("c,hwc->hw", proto_dino, test_dino_hwD)
+            sim_dino_up = F.interpolate(sim_dino.unsqueeze(0).unsqueeze(0),
+                            size=predictor.original_size,
+                            mode="bilinear")[0,0]
+
+
+            # SAM Image feature encoding
             predictor.set_image(img_for_similarity)
             test_feat = predictor.features.squeeze()
 
@@ -284,16 +357,21 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                             original_size=predictor.original_size).squeeze()
             sim = rotate_sim_back(sim, ang)
             test_sims.append(sim)
-        sim = (sum(test_sims)) / len(angles)
+        sim_sam = (sum(test_sims)) / len(angles)
+
+        sim_dino_norm = (sim_dino_up - sim_dino_up.min()) / (sim_dino_up.max() - sim_dino_up.min() + 1e-8)
+        sim_sam_norm  = (sim_sam      - sim_sam.min())      / (sim_sam.max()      - sim_sam.min() + 1e-8)
+
+        fused_sim = torch.sqrt(sim_dino_norm * sim_sam_norm)
 
         # Positive location prior
         # gives the prompt for SAM on the test image
-        topk_xy, topk_label = point_selection(sim, topk=1)
+        topk_xy, topk_label = point_selection(fused_sim, topk=1)
         # print("topyk_xy before neg:", topk_xy)
         # print("topyk_label before neg:", topk_label)
 
         # add negative points
-        neg_xy, neg_label = negative_point_selection(topk_xy, sim, threshold=0.7, step=10000, window=100)
+        neg_xy, neg_label = negative_point_selection(topk_xy, fused_sim, threshold=0.7, step=10000, window=100)
         # print("neg_xy:", neg_xy)
         # print("neg_label:", neg_label)
 
@@ -490,7 +568,7 @@ def get_color_outline(img, k=3, morph=3):
     return outline_rgb
 
 
-def combine_edges_with_image(img, edge_img, alpha=0.1):
+def combine_edges_with_image(img, edge_img, alpha=0):
     """
     Blend edges with original RGB image.
     Both must be uint8 and same size.
