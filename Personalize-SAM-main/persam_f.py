@@ -297,180 +297,186 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     weights_np = weights.detach().cpu().numpy()
     print('======> Mask weights:\n', weights_np)
 
-    print('======> Start Testing')
-    test_images = os.listdir(test_images_path)
-    for test_idx in tqdm(range(len(os.listdir(test_images_path)))):
+    accuracies = {}
+    for alpha in [0, 0.25, 0.5, 0.75, 1.0]:
+        print('======> Start Testing')
+        correct = 0
+        test_images = os.listdir(test_images_path)
+        for test_idx in tqdm(range(len(os.listdir(test_images_path)))):
 
-        # Load test image
-        if obj_name is None:
-            # single-folder mode: use actual filenames from the directory
-            test_image_path = os.path.join(test_images_path, test_images[test_idx])
-        else:
-            # object folder mode: images are named as 00.jpg, 01.jpg, ...
-            test_idx_str = '%02d' % test_idx
-            test_image_path = os.path.join(test_images_path, test_idx_str + '.jpg')
+            # Load test image
+            if obj_name is None:
+                # single-folder mode: use actual filenames from the directory
+                test_image_path = os.path.join(test_images_path, test_images[test_idx])
+                test_mask_path = os.path.join(test_masks_path, test_images[test_idx].replace(".jpg", ".png"))
+            else:
+                # object folder mode: images are named as 00.jpg, 01.jpg, ...
+                test_idx_str = '%02d' % test_idx
+                test_image_path = os.path.join(test_images_path, test_idx_str + '.jpg')
 
-        test_sims = []
-        for ang in angles:
-            ori_test_image = cv2.imread(test_image_path)
-            test_image = rotate_image(ori_test_image, ang)
-            if test_image is None:
-                # Provide extra diagnostics to help debugging missing/corrupt files
-                try:
-                    exists = os.path.exists(test_image_path)
-                    fsize = os.path.getsize(test_image_path) if exists else None
-                except Exception:
-                    exists = False
-                    fsize = None
-                print(f"[Warn] Missing or unreadable test image, skipping: {test_image_path} (exists={exists}, size={fsize})")
-                continue
-            test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
+            test_sims = []
+            for ang in angles:
+                ori_test_image = cv2.imread(test_image_path)
+                test_image = rotate_image(ori_test_image, ang)
+                if test_image is None:
+                    # Provide extra diagnostics to help debugging missing/corrupt files
+                    try:
+                        exists = os.path.exists(test_image_path)
+                        fsize = os.path.getsize(test_image_path) if exists else None
+                    except Exception:
+                        exists = False
+                        fsize = None
+                    print(f"[Warn] Missing or unreadable test image, skipping: {test_image_path} (exists={exists}, size={fsize})")
+                    continue
+                test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
 
-            edge = get_color_outline(test_image)
-            img_for_similarity = combine_edges_with_image(test_image, edge)
-            # DINO
-            test_dino_hwD, _, (hD, wD) = extract_dino_features(img_for_similarity)
-            sim_dino = torch.einsum("c,hwc->hw", proto_dino, test_dino_hwD)
-            sim_dino_up = F.interpolate(sim_dino.unsqueeze(0).unsqueeze(0),
-                            size=predictor.original_size,
-                            mode="bilinear")[0,0]
+                edge = get_color_outline(test_image)
+                img_for_similarity = combine_edges_with_image(test_image, edge)
+                # DINO
+                test_dino_hwD, _, (hD, wD) = extract_dino_features(img_for_similarity)
+                sim_dino = torch.einsum("c,hwc->hw", proto_dino, test_dino_hwD)
+                sim_dino_up = F.interpolate(sim_dino.unsqueeze(0).unsqueeze(0),
+                                size=predictor.original_size,
+                                mode="bilinear")[0,0]
 
 
-            # SAM Image feature encoding
-            predictor.set_image(img_for_similarity)
-            test_feat = predictor.features.squeeze()
+                # SAM Image feature encoding
+                predictor.set_image(img_for_similarity)
+                test_feat = predictor.features.squeeze()
 
-            # Cosine similarity
-            C, h, w = test_feat.shape
-            test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
-            test_feat = test_feat.reshape(C, h * w)
-            # For each test image, it finds the spatial location whose feature vector 
-            # best matches the reference prototype
-            target_feat = target_feats[ang]
-            D = target_feat.shape[-1] 
-            sim = target_feat @ test_feat / (D ** 0.5)
+                # Cosine similarity
+                C, h, w = test_feat.shape
+                test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
+                test_feat = test_feat.reshape(C, h * w)
+                # For each test image, it finds the spatial location whose feature vector 
+                # best matches the reference prototype
+                target_feat = target_feats[ang]
+                D = target_feat.shape[-1] 
+                sim = target_feat @ test_feat / (D ** 0.5)
 
-            sim = sim.reshape(1, 1, h, w)
-            sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
-            sim = predictor.model.postprocess_masks(
-                            sim,
-                            input_size=predictor.input_size,
-                            original_size=predictor.original_size).squeeze()
-            sim = rotate_sim_back(sim, ang)
-            test_sims.append(sim)
-        sim_sam = (sum(test_sims)) / len(angles)
+                sim = sim.reshape(1, 1, h, w)
+                sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+                sim = predictor.model.postprocess_masks(
+                                sim,
+                                input_size=predictor.input_size,
+                                original_size=predictor.original_size).squeeze()
+                sim = rotate_sim_back(sim, ang)
+                test_sims.append(sim)
+            sim_sam = (sum(test_sims)) / len(angles)
 
-        sim_dino_norm = (sim_dino_up - sim_dino_up.min()) / (sim_dino_up.max() - sim_dino_up.min() + 1e-8)
-        sim_sam_norm  = (sim_sam      - sim_sam.min())      / (sim_sam.max()      - sim_sam.min() + 1e-8)
+            sim_dino_norm = (sim_dino_up - sim_dino_up.min()) / (sim_dino_up.max() - sim_dino_up.min() + 1e-8)
+            sim_sam_norm  = (sim_sam      - sim_sam.min())      / (sim_sam.max()      - sim_sam.min() + 1e-8)
 
-        fused_sim = torch.sqrt(sim_dino_norm * sim_sam_norm)
+            fused_sim = (sim_dino_norm ** alpha) * (sim_sam_norm ** (1 - alpha))
 
-        # Positive location prior
-        # gives the prompt for SAM on the test image
-        topk_xy, topk_label = point_selection(fused_sim, topk=1)
-        # print("topyk_xy before neg:", topk_xy)
-        # print("topyk_label before neg:", topk_label)
+            # Positive location prior
+            # gives the prompt for SAM on the test image
+            topk_xy, topk_label = point_selection(fused_sim, topk=1)
+            # print("topyk_xy before neg:", topk_xy)
+            # print("topyk_label before neg:", topk_label)
 
-        # add negative points
-        neg_xy, neg_label = negative_point_selection(topk_xy, fused_sim)
-        # print("neg_xy:", neg_xy)
-        # print("neg_label:", neg_label)
+            # add negative points
+            neg_xy, neg_label = negative_point_selection(topk_xy, fused_sim)
+            # print("neg_xy:", neg_xy)
+            # print("neg_label:", neg_label)
 
-        topk_xy = np.concatenate((topk_xy, neg_xy), axis=0)
-        topk_label = np.concatenate((topk_label, neg_label), axis=0)
-        # print("topyk_xy after neg:", topk_xy)
-        # print("topyk_label after neg:", topk_label)
+            topk_xy = np.concatenate((topk_xy, neg_xy), axis=0)
+            topk_label = np.concatenate((topk_label, neg_label), axis=0)
+            # print("topyk_xy after neg:", topk_xy)
+            # print("topyk_label after neg:", topk_label)
 
-        # Save test-image location prior as a heatmap overlay
-        try:
-            vis_test_image = os.path.splitext(os.path.basename(test_image_path))[0]
-            sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
-            prior_vis_path = os.path.join(output_path, f'prior_{vis_test_image}.jpg')
-            plt.figure(figsize=(8, 8))
+            # Save test-image location prior as a heatmap overlay
+            try:
+                vis_test_image = os.path.splitext(os.path.basename(test_image_path))[0]
+                sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
+                prior_vis_path = os.path.join(output_path, f'prior_{vis_test_image}.jpg')
+                plt.figure(figsize=(8, 8))
+                plt.imshow(test_image)
+                plt.imshow(sim_np, cmap='jet', alpha=1.0)
+                show_points(topk_xy, topk_label, plt.gca())
+                plt.title(f'Location Prior ({vis_test_image})')
+                plt.axis('off')
+                plt.savefig(prior_vis_path, bbox_inches='tight')
+                plt.close()
+            except Exception:
+                pass
+
+            # First-step prediction
+            masks, scores, logits, logits_high = predictor.predict(
+                        point_coords=topk_xy,
+                        point_labels=topk_label,
+                        multimask_output=True)
+
+            # Weighted sum three-scale masks
+            logits_high = logits_high * weights.unsqueeze(-1)
+            logit_high = logits_high.sum(0)
+            mask = (logit_high > 0).detach().cpu().numpy()
+
+            logits = logits * weights_np[..., None]
+            logit = logits.sum(0)
+
+            # Cascaded Post-refinement-1
+            y, x = np.nonzero(mask)
+            x_min = x.min()
+            x_max = x.max()
+            y_min = y.min()
+            y_max = y.max()
+            input_box = np.array([x_min, y_min, x_max, y_max])
+            masks, scores, logits, _ = predictor.predict(
+                point_coords=topk_xy,
+                point_labels=topk_label,
+                box=input_box[None, :],
+                mask_input=logit[None, :, :],
+                multimask_output=True)
+            best_idx = np.argmax(scores)
+
+            # Cascaded Post-refinement-2
+            y, x = np.nonzero(masks[best_idx])
+            x_min = x.min()
+            x_max = x.max()
+            y_min = y.min()
+            y_max = y.max()
+            input_box = np.array([x_min, y_min, x_max, y_max])
+            masks, scores, logits, _ = predictor.predict(
+                point_coords=topk_xy,
+                point_labels=topk_label,
+                box=input_box[None, :],
+                mask_input=logits[best_idx: best_idx + 1, :, :],
+                multimask_output=True)
+            best_idx = np.argmax(scores)
+            
+            # Save masks
+            plt.figure(figsize=(10, 10))
             plt.imshow(test_image)
-            plt.imshow(sim_np, cmap='jet', alpha=1.0)
+            show_mask(masks[best_idx], plt.gca())
             show_points(topk_xy, topk_label, plt.gca())
-            plt.title(f'Location Prior ({vis_test_image})')
+            plt.title(f"Mask {best_idx}", fontsize=18)
             plt.axis('off')
-            plt.savefig(prior_vis_path, bbox_inches='tight')
-            plt.close()
-        except Exception:
-            pass
+            base = os.path.basename(test_image_path) 
+            vis_test_image = os.path.splitext(base)[0] 
+            vis_mask_output_path = os.path.join(output_path, f'vis_mask_{vis_test_image}.jpg')
+            with open(vis_mask_output_path, 'wb') as outfile:
+                plt.savefig(outfile, format='jpg')
 
-        # First-step prediction
-        masks, scores, logits, logits_high = predictor.predict(
-                    point_coords=topk_xy,
-                    point_labels=topk_label,
-                    multimask_output=True)
+            final_mask = masks[best_idx]
+            real_mask = np.array(Image.open(test_mask_path).convert("L")) > 0
 
-        # Weighted sum three-scale masks
-        logits_high = logits_high * weights.unsqueeze(-1)
-        logit_high = logits_high.sum(0)
-        mask = (logit_high > 0).detach().cpu().numpy()
+            threshold = 0.7
+            iou = evaluate_iou(final_mask, real_mask)
+            print(f"Test Image: {test_image_path}, IoU: {iou:.4f}")
+            if iou >= threshold:
+                correct += 1
+            print(f"test path: {test_mask_path}, correct: {correct}")
 
-        logits = logits * weights_np[..., None]
-        logit = logits.sum(0)
+            mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
+            mask_colors[final_mask, :] = np.array([[0, 0, 128]])
+            mask_output_path = os.path.join(output_path, vis_test_image + '.png')
+            cv2.imwrite(mask_output_path, mask_colors)
 
-        # Cascaded Post-refinement-1
-        y, x = np.nonzero(mask)
-        x_min = x.min()
-        x_max = x.max()
-        y_min = y.min()
-        y_max = y.max()
-        input_box = np.array([x_min, y_min, x_max, y_max])
-        masks, scores, logits, _ = predictor.predict(
-            point_coords=topk_xy,
-            point_labels=topk_label,
-            box=input_box[None, :],
-            mask_input=logit[None, :, :],
-            multimask_output=True)
-        best_idx = np.argmax(scores)
-
-        # Cascaded Post-refinement-2
-        y, x = np.nonzero(masks[best_idx])
-        x_min = x.min()
-        x_max = x.max()
-        y_min = y.min()
-        y_max = y.max()
-        input_box = np.array([x_min, y_min, x_max, y_max])
-        masks, scores, logits, _ = predictor.predict(
-            point_coords=topk_xy,
-            point_labels=topk_label,
-            box=input_box[None, :],
-            mask_input=logits[best_idx: best_idx + 1, :, :],
-            multimask_output=True)
-        best_idx = np.argmax(scores)
-        
-        # Save masks
-        plt.figure(figsize=(10, 10))
-        plt.imshow(test_image)
-        show_mask(masks[best_idx], plt.gca())
-        show_points(topk_xy, topk_label, plt.gca())
-        plt.title(f"Mask {best_idx}", fontsize=18)
-        plt.axis('off')
-        base = os.path.basename(test_image_path) 
-        vis_test_image = os.path.splitext(base)[0] 
-        vis_mask_output_path = os.path.join(output_path, f'vis_mask_{vis_test_image}.jpg')
-        with open(vis_mask_output_path, 'wb') as outfile:
-            plt.savefig(outfile, format='jpg')
-
-        final_mask = masks[best_idx]
-        real_mask = np.array(Image.open(test_mask_path).convert("L")) > 0
-
-        threshold = 0.7
-        iou = evaluate_iou(final_mask, real_mask)
-        print(f"Test Image: {test_image_path}, IoU: {iou:.4f}")
-        if iou >= threshold:
-            correct += 1
-        print(f"test path: {test_mask_path}, correct: {correct}")
-
-        mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
-        mask_colors[final_mask, :] = np.array([[0, 0, 128]])
-        mask_output_path = os.path.join(output_path, vis_test_image + '.png')
-        cv2.imwrite(mask_output_path, mask_colors)
-
-    accuracy = correct / (len(os.listdir(test_images_path)))
-    print(f"Accuracy: {accuracy:.4f}")
+        accuracy = correct / (len(os.listdir(test_images_path)))
+        accuracies[alpha] = accuracy
+        print(f"Accuracy: {accuracy:.4f}")
+    print("Accuracies for different weights:", accuracies)
 
 
 class Mask_Weights(nn.Module):

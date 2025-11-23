@@ -30,7 +30,7 @@ python Personalize-SAM-main/persam.py --data Cups.v3i.coco-segmentation/test --o
 
 To run persam_f on the cup datasets, use:
 ```
-python Personalize-SAM-main/persam_f.py --data Cups.v3i.coco-segmentation/test --outdir cups/persam --single true
+python Personalize-SAM-main/persam_f.py --data Cups.v3i.coco-segmentation/test --outdir cups/persamf --single true
 ```
 
 # Compare results
