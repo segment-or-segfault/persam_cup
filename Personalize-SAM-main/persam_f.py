@@ -17,6 +17,7 @@ from per_segment_anything import sam_model_registry, SamPredictor
 device = "cuda" if torch.cuda.is_available() else \
          "mps" if torch.backends.mps.is_available() else "cpu"
 
+
 def get_arguments():
     
     parser = argparse.ArgumentParser()
@@ -86,12 +87,12 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     ref_image = cv2.imread(ref_image_path)
     if ref_image is None:
         raise FileNotFoundError(f"Could not read reference image: {ref_image_path}. Verify --data, object name, index, and extension.")
-    ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
+    ori_ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
 
     ref_mask = cv2.imread(ref_mask_path)
     if ref_mask is None:
         raise FileNotFoundError(f"Could not read reference mask: {ref_mask_path}. Verify the mask exists and path is correct.")
-    ref_mask = cv2.cvtColor(ref_mask, cv2.COLOR_BGR2RGB)
+    ori_ref_mask = cv2.cvtColor(ref_mask, cv2.COLOR_BGR2RGB)
 
     gt_mask = torch.tensor(ref_mask)[:, :, 0] > 0 
     gt_mask = gt_mask.float().unsqueeze(0).flatten(1).to(device)
@@ -112,47 +113,59 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         param.requires_grad = False
     predictor = SamPredictor(sam)
     
+    angles = [0]
+    sims = []
+    target_feats = {}
+    for ang in angles:
+        # Rotate image and mask
+        ref_image_rot = rotate_image(ori_ref_image, ang)
+        ref_mask_rot = rotate_image(ori_ref_mask, ang)
+        print("======> Obtain Self Location Prior" )
+        edge = get_color_outline(ref_image_rot)
+        img_for_similarity = combine_edges_with_image(ref_image_rot, edge)
+        # Image features encoding
+        # side effect: computes and stores the model’s image features (embedding) in predictor.features.
+        # return a mask that you can later use to compute target features.
+        ref_mask = predictor.set_image(img_for_similarity, ref_mask_rot)
+        ref_feat = predictor.features.squeeze().permute(1, 2, 0)
 
-    print("======> Obtain Self Location Prior" )
-    # Image features encoding
-    # side effect: computes and stores the model’s image features (embedding) in predictor.features.
-    # return a mask that you can later use to compute target features.
-    ref_mask = predictor.set_image(ref_image, ref_mask)
-    ref_feat = predictor.features.squeeze().permute(1, 2, 0)
+        ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
+        ref_mask = ref_mask.squeeze()[0]
 
-    ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
-    ref_mask = ref_mask.squeeze()[0]
+        # Target feature extraction describing the handle appearance
+        target_feat = ref_feat[ref_mask > 0]
+        # Averages all feature vectors inside the masked region
+        # Captures the overall, smooth, dominant appearance of the object (stable against noise and small variations)
+        target_feat_mean = target_feat.mean(0)
+        # Takes the elementwise maximum along each feature channel
+        # Highlights the most distinctive or strongest activations among those features (edges, colors, textures that are particularly characteristic)
+        target_feat_max = torch.max(target_feat, dim=0)[0]
+        # Blends representativeness (mean) with discriminativeness (max)
+        target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
 
-    # Target feature extraction describing the handle appearance
-    target_feat = ref_feat[ref_mask > 0]
-    # Averages all feature vectors inside the masked region
-    # Captures the overall, smooth, dominant appearance of the object (stable against noise and small variations)
-    target_feat_mean = target_feat.mean(0)
-    # Takes the elementwise maximum along each feature channel
-    # Highlights the most distinctive or strongest activations among those features (edges, colors, textures that are particularly characteristic)
-    target_feat_max = torch.max(target_feat, dim=0)[0]
-    # Blends representativeness (mean) with discriminativeness (max)
-    target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
+        # Cosine similarity between target feature and all image features
+        h, w, C = ref_feat.shape
+        # Normalize features
+        target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
+        ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
+        ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
+        # gives a cosine similarity map between the target feature and every pixel feature in the image
+        D = target_feat.shape[-1] 
+        sim = target_feat @ ref_feat / (D ** 0.5)
+        target_feats[ang] = target_feat
 
-    # Cosine similarity between target feature and all image features
-    h, w, C = ref_feat.shape
-    # Normalize features
-    target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
-    ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
-    ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
-    # gives a cosine similarity map between the target feature and every pixel feature in the image
-    D = target_feat.shape[-1] 
-    sim = target_feat @ ref_feat / (D ** 0.5)
+        sim = sim.reshape(1, 1, h, w)
+        sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+        sim = predictor.model.postprocess_masks(
+                        sim,
+                        input_size=predictor.input_size,
+                        original_size=predictor.original_size).squeeze()
+        sim = rotate_sim_back(sim, ang)
+        sims.append(sim)
 
-    sim = sim.reshape(1, 1, h, w)
-    sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
-    sim = predictor.model.postprocess_masks(
-                    sim,
-                    input_size=predictor.input_size,
-                    original_size=predictor.original_size).squeeze()
-
+    sim = (sum(sims)) / len(angles)
     # Positive location point on the reference object.
-    topk_xy, topk_label = point_selection(sim, topk=10)
+    topk_xy, topk_label = point_selection(sim, topk=1)
 
     # Save reference location prior as a heatmap overlay on the reference image
     try:
@@ -231,38 +244,47 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             test_idx_str = '%02d' % test_idx
             test_image_path = os.path.join(test_images_path, test_idx_str + '.jpg')
 
-        test_image = cv2.imread(test_image_path)
-        if test_image is None:
-            # Provide extra diagnostics to help debugging missing/corrupt files
-            try:
-                exists = os.path.exists(test_image_path)
-                fsize = os.path.getsize(test_image_path) if exists else None
-            except Exception:
-                exists = False
-                fsize = None
-            print(f"[Warn] Missing or unreadable test image, skipping: {test_image_path} (exists={exists}, size={fsize})")
-            continue
-        test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
+        test_sims = []
+        for ang in angles:
+            ori_test_image = cv2.imread(test_image_path)
+            test_image = rotate_image(ori_test_image, ang)
+            if test_image is None:
+                # Provide extra diagnostics to help debugging missing/corrupt files
+                try:
+                    exists = os.path.exists(test_image_path)
+                    fsize = os.path.getsize(test_image_path) if exists else None
+                except Exception:
+                    exists = False
+                    fsize = None
+                print(f"[Warn] Missing or unreadable test image, skipping: {test_image_path} (exists={exists}, size={fsize})")
+                continue
+            test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
 
-        # Image feature encoding
-        predictor.set_image(test_image)
-        test_feat = predictor.features.squeeze()
+            edge = get_color_outline(test_image)
+            img_for_similarity = combine_edges_with_image(test_image, edge)
+            # Image feature encoding
+            predictor.set_image(img_for_similarity)
+            test_feat = predictor.features.squeeze()
 
-        # Cosine similarity
-        C, h, w = test_feat.shape
-        test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
-        test_feat = test_feat.reshape(C, h * w)
-        # For each test image, it finds the spatial location whose feature vector 
-        # best matches the reference prototype
-        D = target_feat.shape[-1] 
-        sim = target_feat @ test_feat / (D ** 0.5)
+            # Cosine similarity
+            C, h, w = test_feat.shape
+            test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
+            test_feat = test_feat.reshape(C, h * w)
+            # For each test image, it finds the spatial location whose feature vector 
+            # best matches the reference prototype
+            target_feat = target_feats[ang]
+            D = target_feat.shape[-1] 
+            sim = target_feat @ test_feat / (D ** 0.5)
 
-        sim = sim.reshape(1, 1, h, w)
-        sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
-        sim = predictor.model.postprocess_masks(
-                        sim,
-                        input_size=predictor.input_size,
-                        original_size=predictor.original_size).squeeze()
+            sim = sim.reshape(1, 1, h, w)
+            sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+            sim = predictor.model.postprocess_masks(
+                            sim,
+                            input_size=predictor.input_size,
+                            original_size=predictor.original_size).squeeze()
+            sim = rotate_sim_back(sim, ang)
+            test_sims.append(sim)
+        sim = (sum(test_sims)) / len(angles)
 
         # Positive location prior
         # gives the prompt for SAM on the test image
@@ -296,42 +318,42 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         except Exception:
             pass
 
-        # # First-step prediction
-        # masks, scores, logits, logits_high = predictor.predict(
-        #             point_coords=topk_xy,
-        #             point_labels=topk_label,
-        #             multimask_output=True)
+        # First-step prediction
+        masks, scores, logits, logits_high = predictor.predict(
+                    point_coords=topk_xy,
+                    point_labels=topk_label,
+                    multimask_output=True)
 
-        # # Weighted sum three-scale masks
-        # logits_high = logits_high * weights.unsqueeze(-1)
-        # logit_high = logits_high.sum(0)
-        # mask = (logit_high > 0).detach().cpu().numpy()
+        # Weighted sum three-scale masks
+        logits_high = logits_high * weights.unsqueeze(-1)
+        logit_high = logits_high.sum(0)
+        mask = (logit_high > 0).detach().cpu().numpy()
 
-        # logits = logits * weights_np[..., None]
-        # logit = logits.sum(0)
+        logits = logits * weights_np[..., None]
+        logit = logits.sum(0)
 
-        # # Cascaded Post-refinement-1
-        # y, x = np.nonzero(mask)
-        # x_min = x.min()
-        # x_max = x.max()
-        # y_min = y.min()
-        # y_max = y.max()
-        # input_box = np.array([x_min, y_min, x_max, y_max])
-        # masks, scores, logits, _ = predictor.predict(
-        #     point_coords=topk_xy,
-        #     point_labels=topk_label,
-        #     box=input_box[None, :],
-        #     mask_input=logit[None, :, :],
-        #     multimask_output=True)
-        # best_idx = np.argmax(scores)
+        # Cascaded Post-refinement-1
+        y, x = np.nonzero(mask)
+        x_min = x.min()
+        x_max = x.max()
+        y_min = y.min()
+        y_max = y.max()
+        input_box = np.array([x_min, y_min, x_max, y_max])
+        masks, scores, logits, _ = predictor.predict(
+            point_coords=topk_xy,
+            point_labels=topk_label,
+            box=input_box[None, :],
+            mask_input=logit[None, :, :],
+            multimask_output=True)
+        best_idx = np.argmax(scores)
 
-        # # Cascaded Post-refinement-2
-        # y, x = np.nonzero(masks[best_idx])
-        # x_min = x.min()
-        # x_max = x.max()
-        # y_min = y.min()
-        # y_max = y.max()
-        # input_box = np.array([x_min, y_min, x_max, y_max])
+        # Cascaded Post-refinement-2
+        y, x = np.nonzero(masks[best_idx])
+        x_min = x.min()
+        x_max = x.max()
+        y_min = y.min()
+        y_max = y.max()
+        input_box = np.array([x_min, y_min, x_max, y_max])
         masks, scores, logits, _ = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
@@ -365,6 +387,123 @@ class Mask_Weights(nn.Module):
         super().__init__()
         self.weights = nn.Parameter(torch.ones(2, 1, requires_grad=True) / 3)
 
+def rotate_image(img, angle):
+    # angle must be 0, 90, 180, or 270
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
+    if angle == 0:
+        return img
+    elif angle == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    elif angle == 180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    elif angle == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    
+def rotate_sim_back(sim, angle):
+    # sim is torch tensor H×W
+    sim_np = sim.cpu().numpy()
+
+    if angle == 0:
+        sim_rot = sim_np
+    elif angle == 90:
+        sim_rot = cv2.rotate(sim_np, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif angle == 180:
+        sim_rot = cv2.rotate(sim_np, cv2.ROTATE_180)
+    elif angle == 270:
+        sim_rot = cv2.rotate(sim_np, cv2.ROTATE_90_CLOCKWISE)
+    
+    return torch.tensor(sim_rot).to(sim.device)
+
+def get_edge_image(img, blur_ksize=5, canny_lo=50, canny_hi=150, dilate_iter=1):
+    """
+    Extract a clean edge drawing from an RGB image.
+    Returns a 3-channel uint8 edge image suitable for SAM.
+    """
+    # to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # smooth noise
+    blur = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 1.2)
+
+    # Canny edges
+    edges = cv2.Canny(blur, canny_lo, canny_hi)
+
+    # Optional: thicken edges to give SAM stronger cues
+    if dilate_iter > 0:
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=dilate_iter)
+
+    # Convert to 3-channel (SAM expects RGB input)
+    edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+
+    return edges_rgb
+
+import cv2
+import numpy as np
+
+import cv2
+import numpy as np
+
+def get_color_outline(img, k=3, morph=3):
+    """
+    Extracts the OUTER CONTOUR of the cup based on color clusters.
+    Returns a clean outline (3-channel RGB) suitable for SAM.
+    """
+
+    # 1. Downsample for speed 
+    h, w = img.shape[:2]
+    small = cv2.resize(img, (w//2, h//2), interpolation=cv2.INTER_AREA)
+
+    # 2. Lab colorspace -> better color separation
+    lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)
+    Z = lab.reshape((-1,3))
+    Z = np.float32(Z)
+
+    # 3. K-means segmentation
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(Z, k, None, criteria, 5, cv2.KMEANS_RANDOM_CENTERS)
+
+    segmented = centers[labels.flatten()].reshape(lab.shape).astype(np.uint8)
+
+    # 4. Choose cluster with brightest L-channel (likely the cup)
+    L, A, B = cv2.split(segmented)
+    cluster_id = np.argmax([np.mean(L[labels.reshape(h//2, w//2)==i]) for i in range(k)])
+    cup_mask_small = (labels.reshape(h//2, w//2) == cluster_id).astype(np.uint8)*255
+
+    # 5. Resize mask back to original size
+    cup_mask = cv2.resize(cup_mask_small, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    # 6. Morphological cleanup
+    kernel = np.ones((morph, morph), np.uint8)
+    cup_mask = cv2.morphologyEx(cup_mask, cv2.MORPH_CLOSE, kernel)
+    cup_mask = cv2.morphologyEx(cup_mask, cv2.MORPH_OPEN, kernel)
+
+    # 7. Find contour
+    contours, _ = cv2.findContours(cup_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    outline = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(outline, contours, -1, 255, 2)  # thickness = 2 px
+
+    # 8. Convert to 3 channel
+    outline_rgb = cv2.cvtColor(outline, cv2.COLOR_GRAY2BGR)
+
+    return outline_rgb
+
+
+def combine_edges_with_image(img, edge_img, alpha=0.1):
+    """
+    Blend edges with original RGB image.
+    Both must be uint8 and same size.
+    """
+    # ensure uint8
+    img = img.astype(np.uint8)
+    edge_img = edge_img.astype(np.uint8)
+
+    blended = cv2.addWeighted(edge_img, alpha, img, 1 - alpha, 0)
+    cv2.imwrite("blended.jpg", blended)
+    return blended
+
+
 def point_selection(mask_sim, topk=1):
     w, h = mask_sim.shape
     topk_xy = mask_sim.flatten(0).topk(topk)[1]
@@ -376,7 +515,7 @@ def point_selection(mask_sim, topk=1):
     print("topk_xy:", topk_xy)
     return topk_xy, topk_label
 
-def negative_point_selection(pos_xy, mask_sim, threshold=0.7, step=10000, window=100):
+def negative_point_selection(pos_xy, mask_sim, threshold=0.7, step=5000, window=100):
     # unpack positive point (pos_xy is [[px, py]])
     px, py = pos_xy[0]
 
