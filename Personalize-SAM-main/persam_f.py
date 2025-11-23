@@ -435,8 +435,8 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         masks, scores, logits, _ = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
-            # box=input_box[None, :],
-            # mask_input=logits[best_idx: best_idx + 1, :, :],
+            box=input_box[None, :],
+            mask_input=logits[best_idx: best_idx + 1, :, :],
             multimask_output=True)
         best_idx = np.argmax(scores)
         
@@ -454,16 +454,33 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             plt.savefig(outfile, format='jpg')
 
         final_mask = masks[best_idx]
+
+        threshold = 0.7
+        iou = evaluate_iou(final_mask, real_mask)
+        print(f"Test Image: {test_image_path}, IoU: {iou:.4f}")
+        if iou >= threshold:
+            correct += 1
+        print(f"test path: {test_mask_path}, correct: {correct}")
+
         mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
         mask_colors[final_mask, :] = np.array([[0, 0, 128]])
         mask_output_path = os.path.join(output_path, vis_test_image + '.png')
         cv2.imwrite(mask_output_path, mask_colors)
+
+    accuracy = correct / (len(os.listdir(test_images_path)))
+    print(f"Accuracy: {accuracy:.4f}")
 
 
 class Mask_Weights(nn.Module):
     def __init__(self):
         super().__init__()
         self.weights = nn.Parameter(torch.ones(2, 1, requires_grad=True) / 3)
+
+def evaluate_iou(mask_pred, mask_gt):
+    intersection = np.logical_and(mask_pred, mask_gt).sum()
+    union = np.logical_or(mask_pred, mask_gt).sum()
+    iou = intersection / union if union > 0 else 0
+    return iou
 
 def rotate_image(img, angle):
     # angle must be 0, 90, 180, or 270
@@ -593,7 +610,7 @@ def point_selection(mask_sim, topk=1):
     print("topk_xy:", topk_xy)
     return topk_xy, topk_label
 
-def negative_point_selection(pos_xy, mask_sim, threshold=0.85, step=5000, window=100):
+def negative_point_selection(pos_xy, mask_sim, threshold=0.80, step=5000, window=100):
     # unpack positive point (pos_xy is [[px, py]])
     px, py = pos_xy[0]
 
