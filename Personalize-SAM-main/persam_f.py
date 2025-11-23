@@ -371,7 +371,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         # print("topyk_label before neg:", topk_label)
 
         # add negative points
-        neg_xy, neg_label = negative_point_selection(topk_xy, fused_sim, threshold=0.7, step=10000, window=100)
+        neg_xy, neg_label = negative_point_selection(topk_xy, fused_sim)
         # print("neg_xy:", neg_xy)
         # print("neg_label:", neg_label)
 
@@ -593,7 +593,7 @@ def point_selection(mask_sim, topk=1):
     print("topk_xy:", topk_xy)
     return topk_xy, topk_label
 
-def negative_point_selection(pos_xy, mask_sim, threshold=0.7, step=5000, window=100):
+def negative_point_selection(pos_xy, mask_sim, threshold=0.85, step=5000, window=100):
     # unpack positive point (pos_xy is [[px, py]])
     px, py = pos_xy[0]
 
