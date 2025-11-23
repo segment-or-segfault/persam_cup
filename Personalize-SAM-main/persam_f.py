@@ -126,6 +126,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     print("ref_image_path",ref_image_path)
     ref_mask_path = os.path.join(masks_path, obj_name or '', referenceImageName + '.png')
     test_images_path = os.path.join(images_path, obj_name or '')
+    test_masks_path = os.path.join(masks_path, obj_name or '')
 
     output_path = os.path.join(output_path, obj_name or '')
     os.makedirs(output_path, exist_ok=True)
@@ -454,6 +455,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             plt.savefig(outfile, format='jpg')
 
         final_mask = masks[best_idx]
+        real_mask = np.array(Image.open(test_mask_path).convert("L")) > 0
 
         threshold = 0.7
         iou = evaluate_iou(final_mask, real_mask)
