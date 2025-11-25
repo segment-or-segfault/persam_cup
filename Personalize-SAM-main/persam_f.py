@@ -234,6 +234,8 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                     input_size=predictor.input_size,
                     original_size=predictor.original_size).squeeze()
 
+    sims.append(sim)
+
     sim = (sum(sims)) / len(angles)
     # Positive location point on the reference object.
     topk_xy, topk_label = point_selection(sim, topk=1)
@@ -605,12 +607,6 @@ def get_edge_image(img, blur_ksize=5, canny_lo=50, canny_hi=150, dilate_iter=1):
     edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
 
     return edges_rgb
-
-import cv2
-import numpy as np
-
-import cv2
-import numpy as np
 
 def get_color_outline(img, k=3, morph=3):
     """
