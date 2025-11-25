@@ -7,9 +7,9 @@ from pycocotools import mask as maskUtils
 import cv2
 
 # --- paths ---
-json_path = "test/_annotations.coco.json"
-image_dir = "test/Images"
-mask_dir = "test/Annotations"
+json_path = "valid/_annotations.coco.json"
+image_dir = "valid/Images"
+mask_dir = "valid/Annotations"
 
 import shutil
 import os
