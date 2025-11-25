@@ -60,9 +60,10 @@ def main():
         if not files:
             print("⚠️ No images found!")
         else:
-            referenceImage = os.path.join(images_path, sorted(files)[0])
+            referenceImage = os.path.join(images_path, files[0])
             base = os.path.basename(referenceImage) 
             referenceImageName = os.path.splitext(base)[0] 
+            print("Reference image:", referenceImageName)
             persam_f(args, None, images_path, masks_path, referenceImageName, output_path)
 
 
@@ -87,7 +88,12 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     ref_image = cv2.imread(ref_image_path)
     if ref_image is None:
         raise FileNotFoundError(f"Could not read reference image: {ref_image_path}. Verify --data, object name, index, and extension.")
-    ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
+    # Convert to grayscale
+    preprocessed_image = cv2.GaussianBlur(ref_image, (5, 5), sigmaX=0)
+
+    # Equalize histogram to enhance contrast / normalize lighting
+    # gray_eq = cv2.equalizeHist(gray)
+    # preprocessed_image = np.stack([gray]*3, axis=-1)
 
     ref_mask = cv2.imread(ref_mask_path)
     if ref_mask is None:
@@ -116,34 +122,77 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
 
     print("======> Obtain Self Location Prior" )
     # Image features encoding
+    # side effect: computes and stores the model’s image features (embedding) in predictor.features.
+    # return a mask that you can later use to compute target features.
+    predictor.set_image(preprocessed_image)
+    preprocessed_feat = predictor.features.squeeze().permute(1, 2, 0)
+
     ref_mask = predictor.set_image(ref_image, ref_mask)
     ref_feat = predictor.features.squeeze().permute(1, 2, 0)
 
     ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
     ref_mask = ref_mask.squeeze()[0]
 
-    # Target feature extraction
-    target_feat = ref_feat[ref_mask > 0]
-    target_feat_mean = target_feat.mean(0)
-    target_feat_max = torch.max(target_feat, dim=0)[0]
-    target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
+    topk_xy = np.empty((0, 2), dtype=np.int64)
+    topk_label = np.empty((0,), dtype=np.int64)
+    count = 0
+    for feat in [preprocessed_feat, ref_feat]:
+        count += 1
+        # Target feature extraction describing the handle appearance
+        target_feat = feat[ref_mask > 0]
+        # Averages all feature vectors inside the masked region
+        # Captures the overall, smooth, dominant appearance of the object (stable against noise and small variations)
+        target_feat_mean = target_feat.mean(0)
+        # Takes the elementwise maximum along each feature channel
+        # Highlights the most distinctive or strongest activations among those features (edges, colors, textures that are particularly characteristic)
+        target_feat_max = torch.max(target_feat, dim=0)[0]
+        # Blends representativeness (mean) with discriminativeness (max)
+        target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
 
-    # Cosine similarity
-    h, w, C = ref_feat.shape
-    target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
-    ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
-    ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
-    sim = target_feat @ ref_feat
+        # Cosine similarity between target feature and all image features
+        h, w, C = feat.shape
+        # Normalize features
+        target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+        feat = feat.permute(2, 0, 1).reshape(C, h * w)
+        # gives a cosine similarity map between the target feature and every pixel feature in the image
+        sim = target_feat @ feat
 
-    sim = sim.reshape(1, 1, h, w)
-    sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
-    sim = predictor.model.postprocess_masks(
-                    sim,
-                    input_size=predictor.input_size,
-                    original_size=predictor.original_size).squeeze()
+        sim = sim.reshape(1, 1, h, w)
+        sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+        sim = predictor.model.postprocess_masks(
+                        sim,
+                        input_size=predictor.input_size,
+                        original_size=predictor.original_size).squeeze()
 
-    # Positive location prior
-    topk_xy, topk_label = point_selection(sim, topk=5)
+        # Positive location point on the reference object.
+        xy, label = point_selection(sim, topk=1)
+
+        xy = np.asarray(xy, dtype=np.int64).reshape(-1, 2)
+        label = np.asarray(label, dtype=np.int64).reshape(-1)
+
+        # Concatenate as numpy arrays
+        topk_xy = np.concatenate((topk_xy, xy), axis=0)
+        topk_label = np.concatenate((topk_label, label), axis=0)
+
+        # Save reference location prior as a heatmap overlay on the reference image
+        try:
+            sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
+            prior_vis_ref = os.path.join(output_path, 'location_prior_ref_{}.jpg'.format(count))
+            plt.figure(figsize=(8, 8))
+            plt.imshow(ref_image)
+            plt.imshow(sim_np, cmap='jet', alpha=0.5)
+            # Mark the prompt location with a white x
+            prompt_xy = topk_xy[0]  # shape (2,) - [y,x]
+            # Use [x,y] for visualization since plt.scatter expects x,y order
+            plt.scatter([prompt_xy[0]], [prompt_xy[1]], c='white', marker='x', s=100, linewidths=2)
+            plt.title('Location Prior (reference)')
+            plt.axis('off')
+            plt.savefig(prior_vis_ref, bbox_inches='tight')
+            plt.close()
+        except Exception:
+            # non-fatal: if plotting fails, continue
+            pass
 
 
     print('======> Start Training')
@@ -160,10 +209,11 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     optimizer = torch.optim.AdamW(fusion.parameters(), lr=args.lr, eps=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.train_epoch)
 
-
+    # Train combination weights
     for train_idx in range(args.train_epoch):
 
         # Run the decoder
+        # Uses the point we computed to tell SAM where to look
         masks, scores, logits, logits_high = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
@@ -221,6 +271,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             test_image_path = os.path.join(test_images_path, test_idx_str + '.jpg')
         test_image = cv2.imread(test_image_path)
         if test_image is None:
+            # Provide extra diagnostics to help debugging missing/corrupt files
             try:
                 exists = os.path.exists(test_image_path)
                 fsize = os.path.getsize(test_image_path) if exists else None
@@ -231,25 +282,75 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
             continue
         test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
 
+        test_preprocessed_image = cv2.GaussianBlur(test_image, (5, 5), sigmaX=0)
+        # test_gray = cv2.cvtColor(test_image, cv2.COLOR_RGB2GRAY)
+
+        # Equalize histogram to enhance contrast / normalize lighting
+        # test_gray_eq = cv2.equalizeHist(test_gray)
+        # test_preprocessed_image = np.stack([test_gray]*3, axis=-1)
+
+        # Gray test Image feature encoding
+        predictor.set_image(test_preprocessed_image)
+        test_gray_feat = predictor.features.squeeze()
+
         # Image feature encoding
         predictor.set_image(test_image)
         test_feat = predictor.features.squeeze()
-
-        # Cosine similarity
+        
+        # Cosine similarity for the test image
         C, h, w = test_feat.shape
         test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
         test_feat = test_feat.reshape(C, h * w)
-        sim = target_feat @ test_feat
+        # For each test image, it finds the spatial location whose feature vector
+        # best matches the reference prototype
+        test_sim = target_feat @ test_feat
 
-        sim = sim.reshape(1, 1, h, w)
-        sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
-        sim = predictor.model.postprocess_masks(
-                        sim,
-                        input_size=predictor.input_size,
-                        original_size=predictor.original_size).squeeze()
+        # Cosine similarity for the gray test image
+        C, h, w = test_gray_feat.shape
+        test_gray_feat = test_gray_feat / test_gray_feat.norm(dim=0, keepdim=True)
+        test_gray_feat = test_gray_feat.reshape(C, h * w)
+        # For each test image, it finds the spatial location whose feature vector
+        # best matches the reference prototype
+        test_gray_sim = target_feat @ test_gray_feat
+
+        topk_xy = np.empty((0, 2), dtype=np.int64)
+        topk_label = np.empty((0,), dtype=np.int64)
+
+        for sim in [test_gray_sim, test_sim]:
+            sim = sim.reshape(1, 1, h, w)
+            sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+            sim = predictor.model.postprocess_masks(
+                            sim,
+                            input_size=predictor.input_size,
+                            original_size=predictor.original_size).squeeze()
+            
+            # gives the prompt for SAM on the test image
+            xy, label = point_selection(sim, topk=1)
+
+            xy = np.asarray(xy, dtype=np.int64).reshape(-1, 2)
+            label = np.asarray(label, dtype=np.int64).reshape(-1)
+
+            # Concatenate as numpy arrays
+            topk_xy = np.concatenate((topk_xy, xy), axis=0)
+            topk_label = np.concatenate((topk_label, label), axis=0)
 
         # Positive location prior
-        topk_xy, topk_label = point_selection(sim, topk=1)
+        # Save test-image location prior as a heatmap overlay
+        try:
+            vis_test_image = os.path.splitext(os.path.basename(test_image_path))[0]
+            sim_np = sim.detach().cpu().numpy() if isinstance(test_sim, torch.Tensor) else np.array(sim)
+            prior_vis_path = os.path.join(output_path, f'prior_{vis_test_image}.jpg')
+            plt.figure(figsize=(8, 8))
+            plt.imshow(test_image)
+            plt.imshow(sim_np, cmap='jet', alpha=0.5)
+            show_points(topk_xy, topk_label, plt.gca())
+            plt.title(f'Location Prior ({vis_test_image})')
+            plt.axis('off')
+            plt.savefig(prior_vis_path, bbox_inches='tight')
+            plt.close()
+        except Exception:
+            pass
+
 
         # First-step prediction
         masks, scores, logits, logits_high = predictor.predict(
@@ -257,111 +358,114 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
                     point_labels=topk_label,
                     multimask_output=True)
 
-        # Weighted sum three-scale masks
-        # logits_high = logits_high * weights.unsqueeze(-1)
-        # logit_high = logits_high.sum(0)
-        # mask = (logit_high > 0).detach().cpu().numpy()
-        with torch.no_grad():
-            logits_high_t = logits_high.to(device, dtype=torch.float32)
+        # 1. persam_ cascaded refinement (no fusion)
 
-            fused = fusion(logits_high_t)     # [1,H,W]
-        mask = (fused.squeeze(0) > 0).cpu().numpy()
+        # use the highest-score sam  as starting mask
+        base_best = int(np.argmax(scores))
+        base_mask0 = masks[base_best].astype(np.uint8)      # [H_mask, W_mask]
 
-
-        # logits = logits * weights_np[..., None]
-        # logit = logits.sum(0)
-        with torch.no_grad():
-            logits_t = torch.as_tensor(logits, dtype=torch.float32, device=device)
-
-            fused_logits = fusion(logits_t)
-        logit = fused_logits.squeeze(0).cpu().numpy()
-
-        # Cascaded Post-refinement-1
-        # y, x = np.nonzero(mask)
-        # x_min = x.min()
-        # x_max = x.max()
-        # y_min = y.min()
-        # y_max = y.max()
-        # input_box = np.array([x_min, y_min, x_max, y_max])
-        # masks, scores, logits, _ = predictor.predict(
-        #     point_coords=topk_xy,
-        #     point_labels=topk_label,
-        #     box=input_box[None, :],
-        #     mask_input=logit[None, :, :],
-        #     multimask_output=True)
-        # best_idx = np.argmax(scores)
-
-        # # Cascaded Post-refinement-2
-        # y, x = np.nonzero(masks[best_idx])
-        # x_min = x.min()
-        # x_max = x.max()
-        # y_min = y.min()
-        # y_max = y.max()
-        # input_box = np.array([x_min, y_min, x_max, y_max])
-        # masks, scores, logits, _ = predictor.predict(
-        #     point_coords=topk_xy,
-        #     point_labels=topk_label,
-        #     box=input_box[None, :],
-        #     mask_input=logits[best_idx: best_idx + 1, :, :],
-        #     multimask_output=True)
-        # best_idx = np.argmax(scores)
-
-        # ---- Cascaded Post-refinement using fused mask ----
-        # 1. Use fused mask instead of masks[best_idx]
-        y, x = np.nonzero(mask)
-        if len(x) == 0 or len(y) == 0:
-            continue    # skip empty prediction (avoid crash)
-
-        x_min, x_max = x.min(), x.max()
-        y_min, y_max = y.min(), y.max()
-        input_box = np.array([x_min, y_min, x_max, y_max])
-
-
-        # First refinement
-        masks, scores, logits, _ = predictor.predict(
-            point_coords=topk_xy,
-            point_labels=topk_label,
-            box=input_box[None, :],
-            mask_input=fused_logits.squeeze(0).cpu().numpy()[None, :, :],
-            multimask_output=True
-        )
-
-        # Now fuse AGAIN instead of best_idx
-        with torch.no_grad():
-            logits_t = torch.as_tensor(logits, dtype=torch.float32, device=device)
-            fused_logits2 = fusion(logits_t)
-        mask = (fused_logits2.squeeze(0) > 0).cpu().numpy()
-
-        # Second refinement
-        y, x = np.nonzero(mask)
-        if len(x) == 0 or len(y) == 0:
+        # cascade step 1
+        y0, x0 = np.nonzero(base_mask0)
+        if len(x0) == 0 or len(y0) == 0:
+            # nothing there, just skip this image
             continue
 
-        x_min, x_max = x.min(), x.max()
-        y_min, y_max = y.min(), y.max()
+        x_min, x_max = x0.min(), x0.max()
+        y_min, y_max = y0.min(), y0.max()
         input_box = np.array([x_min, y_min, x_max, y_max])
 
-        masks, scores, logits, _ = predictor.predict(
+        masks_ref1, scores_ref1, logits_ref1, _ = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
             box=input_box[None, :],
-            mask_input=fused_logits2.squeeze(0).cpu().numpy()[None, :, :],
+            mask_input=logits[base_best:base_best+1, :, :],
             multimask_output=True
         )
+        best1 = int(np.argmax(scores_ref1))
+        base_mask1 = masks_ref1[best1].astype(np.uint8)
 
-        # Final fused mask
+        # cascade step 2
+        y1, x1 = np.nonzero(base_mask1)
+        if len(x1) == 0 or len(y1) == 0:
+            continue
+
+        x_min, x_max = x1.min(), x1.max()
+        y_min, y_max = y1.min(), y1.max()
+        input_box = np.array([x_min, y_min, x_max, y_max])
+
+        masks_ref2, scores_ref2, logits_ref2, _ = predictor.predict(
+            point_coords=topk_xy,
+            point_labels=topk_label,
+            box=input_box[None, :],
+            mask_input=logits_ref1[best1:best1+1, :, :],
+            multimask_output=True
+        )
+        best2 = int(np.argmax(scores_ref2))
+        base_final = masks_ref2[best2].astype(np.uint8)     # [H_mask, W_mask]
+
+        # keep only the component that touches the positive point
+        prompt_xy = topk_xy[0]   # (x_img, y_img)
+        base_final = keep_component_with_point(base_final, prompt_xy, test_image.shape)
+
+        kernel = np.ones((5, 5), np.uint8)
+        base_dilated = cv2.dilate(base_final, kernel, iterations=1)
+
+        # 2. adaptiveMaskFusion + post-processing
         with torch.no_grad():
-            logits_t = torch.as_tensor(logits, dtype=torch.float32, device=device)
-            fused_final = fusion(logits_t)
+            # fuse multi-scale logits
+            logits_high_t = logits_high.to(device=device, dtype=torch.float32)
+            fused = fusion(logits_high_t)                   # [1, H_mask, W_mask]
 
-        final_mask = (fused_final.squeeze(0) > 0).cpu().numpy()
-        
-        # Save masks
+        # smooth logits to kill spikes
+        fused = F.avg_pool2d(
+            fused.unsqueeze(0), kernel_size=3, stride=1, padding=1
+        ).squeeze(0)                                        # [1, H_mask, W_mask]
+
+        prob = fused.sigmoid()
+        fused_low = (prob.squeeze(0) > 0.2).cpu().numpy().astype(np.uint8)
+
+        # morphology cleanup
+        fused_low = cv2.morphologyEx(fused_low, cv2.MORPH_CLOSE, kernel, iterations=2)
+        fused_low = cv2.dilate(fused_low, kernel, iterations=1)
+
+        # clamp fusion to stay near baseline
+        fused_low = np.logical_and(fused_low, base_dilated).astype(np.uint8)
+
+        overlap = np.logical_and(fused_low, base_final).astype(np.uint8)
+
+        if overlap.sum() == 0:
+            # fused mask does not touch the baseline handle => reject
+            fused_low = np.zeros_like(base_final)
+        else:
+            # keep only the overlapping region
+            fused_low = overlap
+
+
+        # 3. if fused mask looks bad => fall back to baseline
+        fused_area = float(fused_low.sum())
+        base_area  = float(base_final.sum())
+
+        iou_fb = mask_iou(fused_low, base_final)
+
+        # if fused is empty OR overlaps too little OR is too big → baseline
+        if fused_low.sum() == 0 or iou_fb < 0.5 or fused_low.sum() > 1.3 * base_final.sum():
+            final_low = base_final
+        else:
+            final_low = fused_low
+
+        # upsample whichever one we chose to original image size
+        final_mask_up = cv2.resize(
+            final_low,
+            (test_image.shape[1], test_image.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
+
+        # visual
         plt.figure(figsize=(10, 10))
         plt.imshow(test_image)
-        show_mask(final_mask, plt.gca())               # ✅ show fused mask
+        show_mask(final_mask_up, plt.gca())
         show_points(topk_xy, topk_label, plt.gca())
-        plt.title("Fused Final Mask", fontsize=18)
+        plt.title("Final Mask (fusion + fallback)", fontsize=18)
         plt.axis('off')
 
         base = os.path.basename(test_image_path)
@@ -370,11 +474,11 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         plt.savefig(vis_mask_output_path, format='jpg')
         plt.close()
 
-        # Save raw PNG mask
-        mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
-        mask_colors[final_mask, :] = np.array([[0, 0, 128]])
+        mask_colors = np.zeros_like(test_image)
+        mask_colors[final_mask_up > 0] = [255, 0, 0]
         mask_output_path = os.path.join(output_path, vis_test_image + '.png')
         cv2.imwrite(mask_output_path, mask_colors)
+
 
 
 class Mask_Weights(nn.Module):
@@ -382,17 +486,40 @@ class Mask_Weights(nn.Module):
         super().__init__()
         self.weights = nn.Parameter(torch.ones(2, 1, requires_grad=True) / 3)
 
-
 def point_selection(mask_sim, topk=1):
     # Top-1 point selection
     w, h = mask_sim.shape
-    topk_xy = mask_sim.flatten(0).topk(topk)[1]
+    # Get both values and indices of top k
+    values, indices = mask_sim.flatten(0).topk(topk)
+    # print(f"\nShape of similarity map: {mask_sim.shape}")
+    # print(f"Max similarity value: {mask_sim.max().item():.4f}")
+    # print(f"Selected values: {values.cpu().numpy()}")
+    
+    # Find the 2D coordinates of the max value directly
+    # max_pos = mask_sim.argmax()
+    # max_x = (max_pos // h).item()
+    # max_y = (max_pos % h).item()
+    # print(f"Direct max position: ({max_x}, {max_y})")
+    
+    # Original calculation
+    topk_xy = indices
     topk_x = (topk_xy // h).unsqueeze(0)
     topk_y = (topk_xy - topk_x * h)
+    print(f"Calculated position: ({topk_x.item()}, {topk_y.item()})")
+    
+    # Get the similarity value at the calculated position
+    if torch.is_tensor(mask_sim):
+        calc_sim = mask_sim[topk_x.item(), topk_y.item()].item()
+    else:
+        calc_sim = mask_sim[topk_x.item(), topk_y.item()]
+    print(f"Similarity at calculated position: {calc_sim:.4f}")
+    
     topk_xy = torch.cat((topk_y, topk_x), dim=0).permute(1, 0)
     topk_label = np.array([1] * topk)
     topk_xy = topk_xy.cpu().numpy()
-    
+    print("Final selection point (x, y):", topk_xy)
+    print("Final selection label:", topk_label)
+
     return topk_xy, topk_label
 
 
@@ -441,6 +568,42 @@ def calculate_sigmoid_focal_loss(inputs, targets, num_masks = 1, alpha: float = 
 
     return loss.mean(1).sum() / num_masks
 
+def keep_component_with_point(mask, point_xy_img, img_shape):
+    """
+    Keep only the connected component that touches the prompt point.
+    Handles resolution mismatch between SAM mask and full image.
+    """
+    Hm, Wm = mask.shape       # mask resolution (256x256 typically)
+    Hi, Wi = img_shape[:2]    # image resolution (e.g., 600x600)
 
+    # map image coords => mask coords
+    sx = Wm / Wi
+    sy = Hm / Hi
+
+    px, py = point_xy_img     # (x_img, y_img)
+
+    mx = int(round(px * sx))
+    my = int(round(py * sy))
+
+    mx = np.clip(mx, 0, Wm - 1)
+    my = np.clip(my, 0, Hm - 1)
+
+    # CC based on mask resolution
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    label_at_point = labels[my, mx]
+
+    if label_at_point == 0:
+        return mask     # if prompt falls on background
+
+    return (labels == label_at_point).astype(np.uint8)
+
+
+def mask_iou(mask1, mask2):
+    mask1 = mask1.astype(bool)
+    mask2 = mask2.astype(bool)
+    inter = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    return inter / union if union > 0 else 0
+ 
 if __name__ == '__main__':
     main()
