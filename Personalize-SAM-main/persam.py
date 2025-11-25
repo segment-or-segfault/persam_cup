@@ -54,7 +54,7 @@ def main():
         if not files:
             print("⚠️ No images found!")
         else:
-            referenceImage = os.path.join(images_path, sorted(files)[0])
+            referenceImage = os.path.join(images_path, files[0])
             base = os.path.basename(referenceImage) 
             referenceImageName = os.path.splitext(base)[0] 
             persam(args, None, images_path, masks_path, referenceImageName, output_path)
@@ -122,10 +122,13 @@ def persam(args, obj_name, images_path, masks_path, referenceImageName, output_p
     
         # Load test image
         if obj_name is None:
-            test_idx = '%02d' % test_idx
-            test_image_path = test_images_path + '/' + test_idx + '.jpg'
+            # single-folder mode: use actual filenames from the directory
+            test_image_path = os.path.join(test_images_path, test_images[test_idx])
         else:
             test_image_path = test_images[test_idx]
+            # object folder mode: images are named as 00.jpg, 01.jpg, ...
+            test_idx_str = '%02d' % test_idx
+            test_image_path = os.path.join(test_images_path, test_idx_str + '.jpg')
         test_image = cv2.imread(test_image_path)
         if test_image is None:
             print(f"[Warn] Missing test image, skipping: {test_image_path}")
