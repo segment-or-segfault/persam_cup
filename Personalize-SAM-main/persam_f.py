@@ -128,6 +128,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     print("ref_image_path",ref_image_path)
     ref_mask_path = os.path.join(masks_path, obj_name or '', referenceImageName + '.png')
     test_images_path = os.path.join(images_path, obj_name or '')
+    test_masks_path = os.path.join(masks_path, obj_name or '')
 
     output_path = os.path.join(output_path, obj_name or '')
     os.makedirs(output_path, exist_ok=True)
@@ -323,6 +324,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     print("======> Learned Edge-aware Fusion Weights =", learned_w)
 
     print('======> Start Testing')
+    correct = 0
     test_images = os.listdir(test_images_path)
     for test_idx in tqdm(range(len(os.listdir(test_images_path)))):
 
@@ -330,6 +332,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         if obj_name is None:
             # single-folder mode: use actual filenames from the directory
             test_image_path = os.path.join(test_images_path, test_images[test_idx])
+            test_mask_path = os.path.join(test_masks_path, test_images[test_idx].replace(".jpg", ".png"))
         else:
             # object folder mode: images are named as 00.jpg, 01.jpg, ...
             test_idx_str = '%02d' % test_idx
@@ -409,7 +412,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         # Save test-image location prior as a heatmap overlay
         try:
             vis_test_image = os.path.splitext(os.path.basename(test_image_path))[0]
-            sim_np = sim.detach().cpu().numpy() if isinstance(sim, torch.Tensor) else np.array(sim)
+            sim_np = fused_sim.detach().cpu().numpy() if isinstance(fused_sim, torch.Tensor) else np.array(fused_sim)
             prior_vis_path = os.path.join(output_path, f'prior_{vis_test_image}.jpg')
             plt.figure(figsize=(8, 8))
             plt.imshow(test_image)
@@ -538,6 +541,15 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
         plt.title("Final Mask (fusion + fallback)", fontsize=18)
         plt.axis('off')
 
+        real_mask = np.array(Image.open(test_mask_path).convert("L")) > 0
+
+        threshold = 0.7
+        iou = evaluate_iou(final_mask_up, real_mask)
+        print(f"Test Image: {test_image_path}, IoU: {iou:.4f}")
+        if iou >= threshold:
+            correct += 1
+        print(f"test path: {test_mask_path}, correct: {correct}")
+
         base = os.path.basename(test_image_path)
         vis_test_image = os.path.splitext(base)[0]
         vis_mask_output_path = os.path.join(output_path, f"vis_mask_{vis_test_image}.jpg")
@@ -583,6 +595,12 @@ def rotate_sim_back(sim, angle):
         sim_rot = cv2.rotate(sim_np, cv2.ROTATE_90_CLOCKWISE)
     
     return torch.tensor(sim_rot).to(sim.device)
+
+def evaluate_iou(mask_pred, mask_gt):
+    intersection = np.logical_and(mask_pred, mask_gt).sum()
+    union = np.logical_or(mask_pred, mask_gt).sum()
+    iou = intersection / union if union > 0 else 0
+    return iou
 
 def get_edge_image(img, blur_ksize=5, canny_lo=50, canny_hi=150, dilate_iter=1):
     """
