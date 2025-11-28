@@ -298,7 +298,7 @@ def persam_f(args, obj_name, images_path, masks_path, referenceImageName, output
     print('======> Mask weights:\n', weights_np)
 
     accuracies = {}
-    for alpha in [0.5]:
+    for alpha in [0]:
         print('======> Start Testing')
         correct = 0
         test_images = os.listdir(test_images_path)
