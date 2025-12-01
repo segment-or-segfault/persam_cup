@@ -23,7 +23,7 @@ mask_dir = "data/test/Annotations"
 
 To run persam on the cup datasets, use (change the ouput directory as you prefer. If you are using cups/persam, remember to create the directory output/cups first.):
 ```
-python Personalize-SAM-main/persam.py --data Cups.v3i.coco-segmentation/test --outdir cups/persam --single true
+python Personalize-SAM-main/persam.py --data data/Cups.v3i.coco-segmentation/test --outdir cups/persam --single true
 ```
 
 # Persam-f
