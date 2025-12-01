@@ -1,38 +1,118 @@
-# persam_cup
-Persam on cup datasets. 
+# PerSAM-CUP: Personalized Segment Anything for the Cups Dataset
 
-The Personalize-SAM directory is downloaded from the github repo
-https://github.com/ZrrSkywalker/Personalize-SAM. 
+This project adapts [Personalize-SAM](https://github.com/segment-anything/segment-anything) to the CUPS segmentation dataset. It includes:
+- a full modified segmentation pipeline
+- DINOv2 + SAM feature matching
+- cascade refinement
+- our **Adaptive Mask Fusion** module
+- a lightweight React/Vite UI
+- evaluation scripts + pre-generated outputs
 
-All model weights have been put to gitignore due to large file size. Please use the above link and include the following files after you cloned this repo:
-- Personalize-SAM-main/weights/mobile_sam/.pt
-- sam_vit_h_4b8939.pth
+Both backend and frontend run together through a single `make run`.
 
-# Dataset preprocessing
+---
 
-Persam requires the dataset to be in the form /Images and /Annotations where /Images contains the original imgaes and /Annotations contains the masks. The test directory under Cups.v3i.coco-segmentation/ have been changed to this from.
+## Project Structure
 
-If you want to play around with /train and /valid, run the script convert-coco-to-mask.py to convert them into the correct form. Note that you need to manually change the following variables inside the convert-coco-to-mask.py to match the directory.
 ```
-json_path = "test/_annotations.coco.json"
-image_dir = "test/Images"
-mask_dir = "test/Annotations"
+persam_cup/
+├── Makefile
+├── README.md
+├── requirements.txt
+├── run.sh
+├── backend/
+│   └── Personalize-SAM-main/
+│       ├── data/
+│       ├── eval/
+│       ├── outputs/
+│       │   └── results_cups.csv
+│       └── sam_vit_h_4b8939.pth  # SAM ViT-H checkpoint
+└── frontend/
+    └── cupSAM-webui-main/        # React + Vite UI
+└── venv/                        # created automatically
 ```
 
-# Persam
+---
 
-To run persam on the cup datasets, use (change the ouput directory as you prefer. If you are using cups/persam, remember to create the directory output/cups first.):
-```
-python Personalize-SAM-main/persam.py --data Cups.v3i.coco-segmentation/test --outdir cups/persam --single true
-```
+## Backend Pipeline
 
-# Persam-f
-
-To run persam_f on the cup datasets, use:
-```
-python Personalize-SAM-main/persam_f.py --data Cups.v3i.coco-segmentation/test --outdir cups/persam --single true
+The full pipeline is contained in:
+```bash
+backend/Personalize-SAM-main/app.py
 ```
 
-# Compare results
+It implements:
+1. Input reading and pre-processing
+2. DINOv2 feature extraction
+3. SAM feature extraction
+4. Similarity maps (DINO + SAM)
+5. Point selection
+6. Cascade refinement
+7. Adaptive Mask Fusion
+8. Fallback logic
+9. Final mask upsampling and return
 
-To compare results from persam and persam_f, use compare-cup-reuslts.py
+The `/segment` endpoint returns a PNG mask for each query image.
+
+---
+
+## Setup & Running
+
+### 1. Make sure `run.sh` is executable (only once):
+```bash
+chmod +x run.sh
+```
+
+### 2. Start everything (backend + frontend):
+```bash
+make run
+```
+
+`make run` will:
+- install frontend dependencies
+- download the SAM ViT-H checkpoint if missing
+- create a Python virtual environment
+- install backend dependencies
+- start the backend server
+- start the frontend Vite dev server
+
+Frontend will open at:
+```
+http://localhost:8080/
+```
+
+---
+
+## Cleaning Python Caches
+
+To remove all `__pycache__` folders:
+```bash
+make clean
+```
+
+---
+
+## Evaluation
+
+All predicted masks for each method are stored in:
+```bash
+backend/outputs/
+```
+
+To evaluate everything (compute IoU, count IoU ≥ 0.7, write CSV):
+```bash
+cd backend/eval
+python3 evaluate_iou.py
+```
+
+This script automatically scans all folders under `outputs/cups/` and saves:
+```bash
+results_cups.csv
+```
+
+---
+
+## Notes
+- Use **Node 20** (Node 22 causes Vite NAPI errors)
+- The SAM checkpoint is large, so it is downloaded only once
+- Only `make run` and `make clean` are needed for normal use
