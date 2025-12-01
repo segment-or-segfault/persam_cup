@@ -52,8 +52,6 @@ It implements:
 8. Fallback logic
 9. Final mask upsampling and return
 
-The `/segment` endpoint returns a PNG mask for each query image.
-
 ---
 
 ## Setup & Running
